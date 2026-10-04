@@ -14,7 +14,7 @@
       "root": "server",
       "framework": "express",
       "buildCommand": "npm run build",
-      "entrypoint": "dist/src/api.js"
+      "entrypoint": "src/api.ts"
     }
   },
   "rewrites": [
