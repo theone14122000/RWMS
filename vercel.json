@@ -1,0 +1,30 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "client": {
+      "root": "client",
+      "framework": "vite",
+      "buildCommand": "npm run build",
+      "outputDirectory": "dist",
+      "rewrites": [
+        { "source": "/(.*)", "destination": "/index.html" }
+      ]
+    },
+    "server": {
+      "root": "server",
+      "framework": "express",
+      "buildCommand": "npm run build",
+      "entrypoint": "dist/src/api.js"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": { "service": "server" } },
+    { "source": "/(.*)", "destination": { "service": "client" } }
+  ],
+  "env": {
+    "SERVE_CLIENT": "false",
+    "TRUST_PROXY": "1",
+    "DATABASE_PATH": "/tmp/crm.sqlite",
+    "SEED_DEMO_DATA": "false"
+  }
+}
