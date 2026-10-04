@@ -4,6 +4,7 @@
     "client": {
       "root": "client",
       "framework": "vite",
+      "installCommand": "npm install",
       "buildCommand": "npm run build",
       "outputDirectory": "dist",
       "rewrites": [
@@ -13,6 +14,7 @@
     "server": {
       "root": "server",
       "framework": "express",
+      "installCommand": "npm install",
       "buildCommand": "npm run build",
       "entrypoint": "src/api.ts"
     }
