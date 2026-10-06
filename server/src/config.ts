@@ -9,7 +9,18 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 function findServerRoot(start: string): string {
   let dir = start;
   for (;;) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    const pj = path.join(dir, 'package.json');
+    if (fs.existsSync(pj)) {
+      // server/src/package.json only exists to mark the deployed function
+      // bundle (/var/task/src/*.js) as ESM — it is not the server root.
+      let skip = false;
+      try {
+        skip = Boolean(JSON.parse(fs.readFileSync(pj, 'utf8'))?.crmRootSkip);
+      } catch {
+        skip = false;
+      }
+      if (!skip) return dir;
+    }
     const parent = path.dirname(dir);
     if (parent === dir) return path.resolve(start, '..');
     dir = parent;
