@@ -6,7 +6,7 @@ import { seed } from './db/seed.js';
 /** Strip credentials from an error message before surfacing it to a client. */
 function redact(message: string): string {
   return message
-    .replace(/postgres(?:ql)?:\/\/[^\s'"]+/gi, 'postgres://[REDACTED]')
+    .replace(/(?:postgres(?:ql)?|mysql2?):\/\/[^\s'"]+/gi, (m) => `${m.split('://')[0]}://[REDACTED]`)
     .replace(/([?&](?:password|pwd)=)[^\s&]+/gi, '$1[REDACTED]')
     .replace(/\b(password|pwd)(["'\s:=]+)[^\s,'"]+/gi, '$1$2[REDACTED]');
 }

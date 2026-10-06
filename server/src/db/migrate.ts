@@ -3,6 +3,7 @@ import {
   exec,
   get,
   getDb,
+  getDialect,
   isPostgres,
   nowISO,
   openDatabase,
@@ -12,6 +13,7 @@ import {
 } from './database.js';
 import { migrations } from './migrations.js';
 import { pgMigrations } from './pgMigrations.js';
+import { mysqlMigrations } from './mysqlMigrations.js';
 import { config } from '../config.js';
 
 const SCHEMA_MIGRATIONS_DDL = `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -20,10 +22,20 @@ const SCHEMA_MIGRATIONS_DDL = `CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL
 );`;
 
+const MYSQL_SCHEMA_MIGRATIONS_DDL = `CREATE TABLE IF NOT EXISTS schema_migrations (
+  id VARCHAR(191) NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`;
+
 export async function migrate(): Promise<void> {
   openDatabase(config.databasePath);
   if (isPostgres()) {
     await migratePostgres();
+    return;
+  }
+  if (getDialect() === 'mysql') {
+    await migrateMysql();
     return;
   }
 
@@ -91,6 +103,47 @@ async function migratePostgres(): Promise<void> {
   await syncIdentitySequences();
 }
 
+async function migrateMysql(): Promise<void> {
+  await exec(MYSQL_SCHEMA_MIGRATIONS_DDL);
+  const applied = await appliedIds();
+
+  for (const migration of mysqlMigrations) {
+    if (applied.has(migration.id)) continue;
+    // MySQL DDL commits implicitly (no transactional rollback), so each
+    // statement is applied individually; re-runs of an interrupted migration
+    // skip statements that already exist.
+    for (const statement of migration.statements) {
+      try {
+        await exec(statement);
+      } catch (err) {
+        const e = err as { errno?: number; code?: string };
+        // Already applied (the migration marker is only written once every
+        // statement passes, so a resumed run re-executes the earlier ones).
+        if (
+          e.errno === 1050 || e.errno === 1060 || e.errno === 1061 ||
+          e.code === 'ER_TABLE_EXISTS_ERROR' || e.code === 'ER_DUP_FIELDNAME' ||
+          e.code === 'ER_DUP_KEYNAME'
+        ) {
+          continue;
+        }
+        throw new Error(
+          `MySQL migration ${migration.id} (${migration.name}) failed: ${(err as Error).message}`,
+        );
+      }
+    }
+    try {
+      await run(
+        'INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING',
+        [migration.id, migration.name, nowISO()],
+      );
+    } catch (err) {
+      throw new Error(
+        `MySQL migration ${migration.id} (${migration.name}) marker failed: ${(err as Error).message}`,
+      );
+    }
+  }
+}
+
 async function syncIdentitySequences(): Promise<void> {
   const cols = await all<{ tbl: string; col: string }>(
     `SELECT table_name AS tbl, column_name AS col
@@ -114,9 +167,12 @@ export async function migrationStatus(): Promise<
   Array<{ id: string; name: string; applied: boolean }>
 > {
   const rows = await appliedIds();
-  const list = isPostgres()
-    ? pgMigrations.map((m) => ({ id: m.id, name: m.name }))
-    : migrations.map((m) => ({ id: m.id, name: m.name }));
+  const list =
+    getDialect() === 'mysql'
+      ? mysqlMigrations.map((m) => ({ id: m.id, name: m.name }))
+      : getDialect() === 'pg'
+        ? pgMigrations.map((m) => ({ id: m.id, name: m.name }))
+        : migrations.map((m) => ({ id: m.id, name: m.name }));
   return list.map((m) => ({ ...m, applied: rows.has(m.id) }));
 }
 

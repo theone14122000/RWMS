@@ -115,8 +115,15 @@ function mapEventToStatus(eventType: string): string | null {
 
 function isUniqueViolation(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
-  // SQLite: "UNIQUE constraint failed"; PostgreSQL: SQLSTATE 23505.
-  return /UNIQUE constraint failed/i.test(err.message) || (err as { code?: string }).code === '23505';
+  // SQLite: "UNIQUE constraint failed"; PostgreSQL: SQLSTATE 23505;
+  // MySQL: ER_DUP_ENTRY / errno 1062 ("Duplicate entry ... for key ...").
+  return (
+    /UNIQUE constraint failed/i.test(err.message) ||
+    /Duplicate entry/i.test(err.message) ||
+    (err as { code?: string }).code === '23505' ||
+    (err as { code?: string }).code === 'ER_DUP_ENTRY' ||
+    (err as { errno?: number }).errno === 1062
+  );
 }
 
 async function findCall(provider: string, providerCallId: string) {

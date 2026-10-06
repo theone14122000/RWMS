@@ -3,28 +3,41 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import pg from 'pg';
+import mysql from 'mysql2/promise';
+import type { Pool as MysqlPool, PoolConnection as MysqlConn } from 'mysql2/promise';
 import { config } from '../config.js';
 
 export type Row = Record<string, any>;
 
 /**
- * Dual-mode database layer.
+ * Triple-mode database layer.
  *
- * - PostgreSQL when `DATABASE_URL` is set (production / Railway): async pool,
- *   per-transaction client tracked in AsyncLocalStorage so nested `tx()` calls
- *   use savepoints on the same connection.
+ * - MySQL when `DATABASE_URL` starts with `mysql` (production / Railway):
+ *   promise pool, per-transaction connection tracked in AsyncLocalStorage so
+ *   nested `tx()` calls use savepoints on the same connection.
+ * - PostgreSQL when `DATABASE_URL` starts with `postgres`: async pool with the
+ *   same AsyncLocalStorage savepoint scheme.
  * - SQLite (node:sqlite) otherwise (local dev / tests): the legacy synchronous
  *   engine, serialized behind a mutex because the public API is now async and
  *   a yielding transaction must not interleave with unrelated queries.
  *
- * Public API (both modes): async `get` / `all` / `run` / `exec` / `tx`.
+ * Public API (all modes): async `get` / `all` / `run` / `exec` / `tx`.
+ * SQLite-flavoured SQL is translated per-dialect at call time (`toMySql`,
+ * `toPg`); MySQL keeps `?` placeholders, PostgreSQL rewrites them to `$n`.
  */
 
-const usePg = Boolean(config.databaseUrl);
+const dbDialect: 'sqlite' | 'pg' | 'mysql' = !config.databaseUrl
+  ? 'sqlite'
+  : /^mysql2?:/i.test(config.databaseUrl)
+    ? 'mysql'
+    : 'pg';
+const usePg = dbDialect === 'pg';
+const useMysql = dbDialect === 'mysql';
 
 type PgScope = { kind: 'pg'; client: pg.PoolClient; depth: number };
+type MysqlScope = { kind: 'mysql'; conn: MysqlConn; depth: number };
 type SqliteScope = { kind: 'sqlite'; depth: number };
-type Scope = PgScope | SqliteScope;
+type Scope = PgScope | MysqlScope | SqliteScope;
 
 const als = new AsyncLocalStorage<Scope>();
 
@@ -235,6 +248,155 @@ async function pgQuery(
   }
 }
 
+// --------------------------------------------------------------------- MySQL
+
+let myPool: MysqlPool | null = null;
+
+function getMysql(): MysqlPool {
+  if (!myPool) {
+    const u = new URL(config.databaseUrl);
+    const sslParam = u.searchParams.get('ssl');
+    myPool = mysql.createPool({
+      host: u.hostname,
+      port: u.port ? Number(u.port) : 3306,
+      user: decodeURIComponent(u.username),
+      password: decodeURIComponent(u.password),
+      database: u.pathname.replace(/^\//, ''),
+      charset: 'utf8mb4',
+      connectionLimit: config.pgPoolMax,
+      idleTimeout: 30_000,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 15_000,
+      connectTimeout: 20_000,
+      // migrate() applies each migration as one multi-statement exec().
+      multipleStatements: true,
+      // TEXT ISO parity: never parse DATE/DATETIME columns into JS Dates.
+      dateStrings: true,
+      // DECIMAL -> Number (mirrors pg's setTypeParser(1700)).
+      decimalNumbers: true,
+      timezone: 'Z',
+      ...(sslParam && sslParam !== 'false' ? { ssl: { rejectUnauthorized: false } } : {}),
+    });
+    (myPool as any).on?.('error', (err: Error) => {
+      console.error('[crm] idle mysql connection error:', err.message);
+    });
+  }
+  return myPool;
+}
+
+const UNIT = (u: string) => u.replace(/s$/i, '').toUpperCase();
+const interval = (n: string, u: string) => `INTERVAL ${n.replace(/^\+/, '')} ${UNIT(u)}`;
+
+/** Converts SQLite-flavoured SQL to MySQL at call time. */
+function toMySql(sql: string): string {
+  let work = sql;
+
+  if (/^\s*INSERT\s+OR\s+IGNORE\s+INTO\b/i.test(work)) {
+    work = work.replace(/^\s*INSERT\s+OR\s+IGNORE\s+INTO\b/i, 'INSERT IGNORE INTO');
+  }
+
+  // ON CONFLICT ... DO NOTHING (with or without a conflict target) -> INSERT IGNORE.
+  const nothing = /\s*ON\s+CONFLICT(?:\s*\([^)]*\))?\s+DO\s+NOTHING\b/i.exec(work);
+  if (nothing) {
+    work = work.slice(0, nothing.index) + work.slice(nothing.index + nothing[0].length);
+    work = work.replace(/^\s*INSERT\s+INTO\b/i, 'INSERT IGNORE INTO');
+  }
+
+  // ON CONFLICT (...) DO UPDATE SET ... excluded.x -> ON DUPLICATE KEY UPDATE ... VALUES(x).
+  if (/\bON\s+CONFLICT\b/i.test(work)) {
+    work = work.replace(
+      /\s*ON\s+CONFLICT(?:\s*\([^)]*\))?\s+DO\s+UPDATE\s+SET\b/i,
+      ' ON DUPLICATE KEY UPDATE',
+    );
+    work = work.replace(/\bexcluded\.([A-Za-z_]\w*)/gi, 'VALUES($1)');
+  }
+
+  // SQLite CAST(x AS INTEGER) → MySQL CAST(x AS SIGNED).
+  work = work.replace(/(\bCAST\s*\(\s*)([\s\S]*?)(\s+AS\s+)INTEGER\b/gi, '$1$2$3SIGNED');
+
+  // SQLite COLLATE NOCASE is ASCII case-insensitive; lower() on the operand matches.
+  work = work.replace(
+    /([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\s+COLLATE\s+NOCASE\b/gi,
+    (_m, col: string) => `lower(${col})`,
+  );
+
+  // SQLite date('now'[, modifier]) -> TEXT calendar date (all date columns are TEXT).
+  work = work.replace(
+    /date\('now'(?:,\s*'([+-]?\d+)\s+(days?|hours?|minutes?|months?|years?)')?\)/gi,
+    (_m, n: string | undefined, u: string | undefined) =>
+      n === undefined
+        ? `DATE_FORMAT(CURDATE(), '%Y-%m-%d')`
+        : `DATE_FORMAT(DATE_ADD(CURDATE(), ${interval(n, u!)}), '%Y-%m-%d')`,
+  );
+
+  // SQLite date(substr(col, 1, 19), '+5 hours', '+30 minutes') -> local calendar date.
+  work = work.replace(
+    /date\(substr\(([\w.]+),\s*1,\s*19\)((?:,\s*'[+-]?\d+\s+(?:hours?|minutes?)')+)\)/gi,
+    (_m, col: string, modsRaw: string) => {
+      const parts = [...modsRaw.matchAll(/'([+-]?\d+)\s+(hours?|minutes?)'/g)].map(([, n, u]) =>
+        interval(n, u),
+      );
+      let expr = `STR_TO_DATE(SUBSTR(${col}, 1, 19), '%Y-%m-%dT%H:%i:%s')`;
+      for (const p of parts) expr = `DATE_ADD(${expr}, ${p})`;
+      return `DATE_FORMAT(${expr}, '%Y-%m-%d')`;
+    },
+  );
+
+  // SQLite date(<expr>, '±N unit') -> local calendar date (text-comparison semantics).
+  work = work.replace(
+    /date\(([\w.$?]+),\s*'([+-]?\d+)\s+(days?|hours?|minutes?|months?|years?)'\)/gi,
+    (_m, arg: string, n: string, u: string) =>
+      `DATE_FORMAT(DATE_ADD(STR_TO_DATE(SUBSTRING(${arg}, 1, 19), '%Y-%m-%dT%H:%i:%s'), ${interval(
+        n,
+        u,
+      )}), '%Y-%m-%d')`,
+  );
+
+  return work;
+}
+
+async function mysqlQuery(
+  conn: MysqlConn | null,
+  sql: string,
+  params: unknown[],
+): Promise<{ rows: Row[]; rowCount: number; insertId: number }> {
+  try {
+    const text = toMySql(sql);
+    let lastErr: unknown;
+    // Transient proxy/socket drops are safe to retry outside an explicit
+    // transaction — each attempt grabs a fresh pooled connection.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const target = conn ?? getMysql();
+        const [res] = await target.query(text, normalize(params));
+        if (Array.isArray(res)) {
+          const rows = res as Row[];
+          return { rows, rowCount: rows.length, insertId: 0 };
+        }
+        const ok = res as { affectedRows?: number; insertId?: number };
+        return { rows: [], rowCount: Number(ok.affectedRows ?? 0), insertId: Number(ok.insertId ?? 0) };
+      } catch (err) {
+        lastErr = err;
+        const e = err as { code?: string; errno?: number };
+        const code = e.code ?? '';
+        const quick =
+          code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'EPIPE' ||
+          code === 'ENOTFOUND' || code === 'EAI_AGAIN' ||
+          e.errno === 2006 || e.errno === 2013 || e.errno === 2055;
+        if (conn || !quick) break;
+        if (attempt === 2) break;
+        await new Promise((r) => setTimeout(r, 400 * 2 ** attempt));
+      }
+    }
+    throw lastErr;
+  } catch (err) {
+    const e = err as Error & { sql?: string };
+    e.sql = sql.replace(/\s+/g, ' ').slice(0, 300);
+    e.message = `${e.message}\nSQL: ${e.sql}`;
+    throw e;
+  }
+}
+
 // ------------------------------------------------------------------- SQLite
 
 let db: DatabaseSync | null = null;
@@ -255,7 +417,7 @@ function withMutex<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export function openDatabase(filePath: string = config.databasePath): void {
-  if (usePg) return;
+  if (dbDialect !== 'sqlite') return;
   if (db) closeSync();
   if (filePath !== ':memory:') {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -289,15 +451,20 @@ export async function closeDatabase(): Promise<void> {
     idColumnCache = null;
     await p.end();
   }
+  if (myPool) {
+    const p = myPool;
+    myPool = null;
+    await p.end();
+  }
 }
 
 export function databasePath(): string {
-  if (usePg) {
+  if (usePg || useMysql) {
     try {
       const u = new URL(config.databaseUrl);
-      return `postgres://${u.host}${u.pathname}`;
+      return `${useMysql ? 'mysql' : 'postgres'}://${u.host}${u.pathname}`;
     } catch {
-      return 'postgres';
+      return useMysql ? 'mysql' : 'postgres';
     }
   }
   return dbPath;
@@ -307,8 +474,12 @@ export function isPostgres(): boolean {
   return usePg;
 }
 
+export function getDialect(): 'sqlite' | 'pg' | 'mysql' {
+  return dbDialect;
+}
+
 export function getDb(): DatabaseSync {
-  if (usePg) throw new Error('getDb() is unavailable in PostgreSQL mode');
+  if (dbDialect !== 'sqlite') throw new Error(`getDb() is unavailable in ${dbDialect} mode`);
   if (!db) openDatabase();
   return db!;
 }
@@ -359,6 +530,15 @@ async function query(
   sql: string,
   params: unknown[],
 ): Promise<{ rows: Row[]; changes: number; lastInsertRowid: number }> {
+  if (useMysql) {
+    const scope = als.getStore();
+    const { rows, rowCount, insertId } = await mysqlQuery(
+      scope?.kind === 'mysql' ? scope.conn : null,
+      sql,
+      params,
+    );
+    return { rows, changes: rowCount, lastInsertRowid: insertId || Number(rows[0]?.id ?? 0) };
+  }
   if (usePg) {
     const scope = als.getStore();
     const { rows, rowCount } = await pgQuery(scope?.kind === 'pg' ? scope.client : null, sql, params);
@@ -387,6 +567,18 @@ export async function run(
 
 /** Executes one or more raw statements (no parameters). */
 export async function exec(sql: string): Promise<void> {
+  if (useMysql) {
+    const scope = als.getStore();
+    try {
+      if (scope?.kind === 'mysql') await scope.conn.query(sql);
+      else await getMysql().query(sql);
+    } catch (err) {
+      const e = err as Error;
+      e.message = `${e.message}\nSQL: ${sql.replace(/\s+/g, ' ').slice(0, 300)}`;
+      throw e;
+    }
+    return;
+  }
   if (usePg) {
     const scope = als.getStore();
     try {
@@ -408,6 +600,51 @@ export async function exec(sql: string): Promise<void> {
 
 /** Runs `fn` inside a transaction (nested calls use savepoints). */
 export async function tx<T>(fn: () => Promise<T>): Promise<T> {
+  if (useMysql) {
+    const scope = als.getStore();
+    if (scope?.kind === 'mysql') {
+      const sp = `sp_${scope.depth}`;
+      await scope.conn.query(`SAVEPOINT ${sp}`);
+      try {
+        const result = await fn();
+        await scope.conn.query(`RELEASE SAVEPOINT ${sp}`);
+        return result;
+      } catch (err) {
+        try {
+          await scope.conn.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+          await scope.conn.query(`RELEASE SAVEPOINT ${sp}`);
+        } catch {
+          /* rollback best effort */
+        }
+        throw err;
+      }
+    }
+    const conn = await getMysql().getConnection();
+    // A fatal socket error on the checked-out connection must not crash the
+    // process (EventEmitter throws when 'error' has no listeners).
+    let socketBroke = false;
+    const onConnError = () => {
+      socketBroke = true;
+    };
+    (conn as any).on?.('error', onConnError);
+    try {
+      await conn.query('BEGIN');
+      const result = await als.run({ kind: 'mysql', conn, depth: 1 }, fn);
+      await conn.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await conn.query('ROLLBACK');
+      } catch {
+        /* rollback best effort */
+      }
+      throw err;
+    } finally {
+      (conn as any).removeListener?.('error', onConnError);
+      if (socketBroke) conn.destroy();
+      else conn.release();
+    }
+  }
   if (usePg) {
     const scope = als.getStore();
     if (scope?.kind === 'pg') {

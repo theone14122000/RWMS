@@ -86,8 +86,9 @@ export const config = {
   port: num('PORT', 4000),
   host: str('HOST', '0.0.0.0'),
   databasePath: str('DATABASE_PATH', path.join(SERVER_ROOT, 'data', 'crm.sqlite')),
-  // PostgreSQL connection string (e.g. Railway). When set the app uses PG;
-  // when empty it falls back to the local SQLite file (dev/tests).
+  // Database connection string. `mysql://…` uses MySQL, `postgres://…` uses
+  // PostgreSQL (production / Railway); empty falls back to the local SQLite
+  // file (dev/tests).
   databaseUrl: str('DATABASE_URL', ''),
   pgPoolMax: num('PG_POOL_MAX', 10),
   sessionCookieName: str('SESSION_COOKIE', 'ta_crm_session'),
