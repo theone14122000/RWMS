@@ -217,10 +217,28 @@ export const originGuard: RequestHandler = (req, _res, next) => {
   const origin = req.headers.origin;
   if (!origin) return next();
   const host = req.headers.host;
+  if (!host) return next();
+  let originUrl: URL;
   try {
-    if (!host || new URL(origin).host === host) return next();
+    originUrl = new URL(origin);
   } catch {
     /* invalid origin header */
+    return next(forbidden('Cross-origin request blocked.'));
   }
+  if (originUrl.host === host) return next();
+  // A site is identified by its hostname, not its port: dev servers (Vite on
+  // :5173) proxy to this API on another port, and localhost/127.0.0.1 are the
+  // same machine. Any remote origin (evil.com etc.) still fails the hostname
+  // comparison and stays blocked.
+  let hostName: string;
+  try {
+    hostName = new URL(`http://${host}`).hostname;
+  } catch {
+    hostName = host.split(':')[0];
+  }
+  const originName = originUrl.hostname;
+  const loopback = (name: string) =>
+    name === 'localhost' || name === '127.0.0.1' || name === '::1' || name === '[::1]';
+  if (originName === hostName || (loopback(originName) && loopback(hostName))) return next();
   return next(forbidden('Cross-origin request blocked.'));
 };
