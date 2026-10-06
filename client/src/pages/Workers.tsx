@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react';
+import { Link } from 'react-router-dom';
 import { ApiError, patch, post, qs } from '../api/client';
 import { useQuery } from '../lib/useQuery';
 import { formatDate, timeAgo } from '../lib/format';
@@ -342,6 +343,7 @@ function WorkerModal({
 
 function WorkerDrawer({ id, onClose }: { id: number; onClose: () => void }) {
   const { data: payload, loading, error, reload } = useQuery<any>(`/api/users/${id}`);
+  const { data: activity } = useQuery<{ data: any[] }>(`/api/users/${id}/activity?limit=15`);
   const data = payload?.data;
 
   return (
@@ -402,6 +404,34 @@ function WorkerDrawer({ id, onClose }: { id: number; onClose: () => void }) {
               <div>
                 <span className="muted">Created:</span> {formatDate(data.created_at)}
               </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-head">
+              <h3>Recent activity</h3>
+              <span className="right small muted">{activity?.data?.length ?? 0} events</span>
+            </div>
+            <div className="card-body">
+              {!activity?.data?.length ? (
+                <div className="small muted">No recorded activity yet.</div>
+              ) : (
+                <div className="stack" style={{ gap: 10 }}>
+                  {activity.data.map((a) => (
+                    <div key={a.id} className="row" style={{ gap: 10, alignItems: 'baseline' }}>
+                      <span className="small muted nowrap" style={{ whiteSpace: 'nowrap', minWidth: 74 }}>
+                        {timeAgo(a.created_at)}
+                      </span>
+                      <span className="small">{a.summary}</span>
+                      {a.lead_id ? (
+                        <Link className="small mono right" to={`/leads/${a.lead_id}`} style={{ marginLeft: 'auto' }}>
+                          {a.lead_number}
+                        </Link>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>

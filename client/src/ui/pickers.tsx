@@ -65,3 +65,31 @@ export function LeadPicker({ value, onChange }: { value: any | null; onChange: (
     </div>
   );
 }
+
+/** Worker dropdown used by admin filters (calls, follow-ups). Needs users:list access. */
+export function WorkerPicker({
+  value,
+  onChange,
+  allLabel = 'All workers',
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  allLabel?: string;
+}) {
+  const { data } = useQuery<ListResponse<any>>('/api/users?limit=100');
+  return (
+    <select
+      className="select"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      aria-label="Filter by worker"
+    >
+      <option value="">{allLabel}</option>
+      {(data?.data ?? []).map((w: any) => (
+        <option key={w.id} value={w.id}>
+          {w.name}
+        </option>
+      ))}
+    </select>
+  );
+}

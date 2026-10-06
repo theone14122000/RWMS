@@ -14,7 +14,7 @@ import {
   TableSkeleton,
 } from '../ui/atoms';
 import { Drawer, Modal, useConfirm } from '../ui/overlays';
-import { LeadPicker } from '../ui/pickers';
+import { LeadPicker, WorkerPicker } from '../ui/pickers';
 import { useToast } from '../ui/Toast';
 
 const CALL_STATUSES = ['RINGING', 'ANSWERED', 'MISSED', 'BUSY', 'FAILED', 'NO_ANSWER', 'COMPLETED'];
@@ -51,6 +51,7 @@ export default function Calls() {
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('');
   const [direction, setDirection] = useState('');
+  const [workerId, setWorkerId] = useState('');
   const [period, setPeriod] = useState('30d');
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [logOpen, setLogOpen] = useState(false);
@@ -61,7 +62,7 @@ export default function Calls() {
   const statsScope = can('calls:read_all') ? '&scope=all' : '';
   const { data: stats, reload: reloadStats } = useQuery<any>(`/api/calls/stats/summary?period=${kpiPeriod}${statsScope}`, [reloadKey]);
 
-  const listQs = qs({ page, limit, search, status, direction, period });
+  const listQs = qs({ page, limit, search, status, direction, period, worker_id: workerId });
   const { data, loading, error, reload } = useQuery<ListResponse<any>>(`/api/calls${listQs}`, [reloadKey]);
   const calls = data?.data ?? [];
   const meta = data?.meta;
@@ -147,6 +148,9 @@ export default function Calls() {
           <option value="OUTBOUND">Outbound</option>
           <option value="INBOUND">Inbound</option>
         </select>
+        {can('calls:read_all') ? (
+          <WorkerPicker value={workerId} onChange={(v) => { setWorkerId(v); setPage(1); }} />
+        ) : null}
         <select className="select" value={period} onChange={(e) => { setPeriod(e.target.value); setPage(1); }}>
           <option value="">All time</option>
           {PERIODS.map((p) => (

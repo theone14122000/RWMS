@@ -18,6 +18,7 @@ import {
   Tabs,
 } from '../ui/atoms';
 import { Modal, useConfirm } from '../ui/overlays';
+import { WorkerPicker } from '../ui/pickers';
 import { useToast } from '../ui/Toast';
 
 const COLUMNS = [
@@ -180,7 +181,7 @@ export default function FollowUps() {
           <option value="NOT_INTERESTED">Not interested</option>
         </select>
         {can('follow_ups:read_all') ? (
-          <WorkerFilter value={params.get('worker_id') ?? ''} onChange={(v) => setFilter('worker_id', v)} />
+          <WorkerPicker value={params.get('worker_id') ?? ''} onChange={(v) => setFilter('worker_id', v)} />
         ) : null}
         <input
           className="input"
@@ -380,20 +381,6 @@ export default function FollowUps() {
         />
       ) : null}
     </>
-  );
-}
-
-function WorkerFilter({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const { data } = useQuery<{ data: any[] }>('/api/users?limit=100');
-  return (
-    <select className="select" value={value} onChange={(e) => onChange(e.target.value)}>
-      <option value="">All workers</option>
-      {(data?.data ?? []).map((w) => (
-        <option key={w.id} value={w.id}>
-          {w.name}
-        </option>
-      ))}
-    </select>
   );
 }
 
