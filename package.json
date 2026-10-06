@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Travel Agency CRM - Part 1 (Foundation, Authentication, Workers, Customers, Leads & Follow-ups)",
+  "description": "Travel Agency CRM - Part 1 (Foundation, Authentication, Workers, Customers, Leads & Follow-ups) - SQLite/MySQL/PostgreSQL backends",
   "workspaces": [
     "server",
     "client"
