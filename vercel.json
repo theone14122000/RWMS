@@ -27,7 +27,6 @@
     "SERVE_CLIENT": "false",
     "TRUST_PROXY": "1",
     "DATABASE_PATH": "/tmp/crm.sqlite",
-    "DATABASE_URL": "mysql://root:AiFDmLsgSvnmMIXHPIWRZRFeguTOXOYZ@sakura.proxy.rlwy.net:22036/railway",
     "ADMIN_EMAIL": "admin@ruxec.com"
   }
 }
