@@ -1,5 +1,9 @@
 node_modules/
-dist/
+client/dist/
+server/dist/*
+!server/dist/bundle/
+server/dist/bundle/*
+!server/dist/bundle/api.mjs
 server/data/
 *.log
 .env
