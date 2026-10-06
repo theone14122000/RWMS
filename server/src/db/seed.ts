@@ -77,19 +77,19 @@ export const DEFAULT_SETTINGS: Record<string, unknown> = {
 };
 
 
-function seedRbac(): void {
+async function seedRbac(): Promise<void> {
   const now = nowISO();
   for (const role of ROLES) {
-    const existing = get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [role.code]);
+    const existing = await get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [role.code]);
     if (existing) {
-      run('UPDATE roles SET name = ?, description = ?, updated_at = ? WHERE id = ?', [
+      await run('UPDATE roles SET name = ?, description = ?, updated_at = ? WHERE id = ?', [
         role.name,
         role.description,
         now,
         existing.id,
       ]);
     } else {
-      run('INSERT INTO roles (code, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
+      await run('INSERT INTO roles (code, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
         role.code,
         role.name,
         role.description,
@@ -100,7 +100,7 @@ function seedRbac(): void {
   }
 
   for (const perm of PERMISSIONS) {
-    run(
+    await run(
       `INSERT INTO permissions (code, name, category, created_at)
        VALUES (?, ?, ?, ?)
        ON CONFLICT(code) DO UPDATE SET name = excluded.name, category = excluded.category`,
@@ -109,15 +109,15 @@ function seedRbac(): void {
   }
 
   for (const role of ROLES) {
-    const roleRow = get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [role.code]);
+    const roleRow = await get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [role.code]);
     if (!roleRow) continue;
     const codes = ROLE_PERMISSIONS[role.code] ?? [];
-    const rows = all<{ id: number; code: string }>('SELECT id, code FROM permissions');
+    const rows = await all<{ id: number; code: string }>('SELECT id, code FROM permissions');
     const allowed = new Set(codes);
-    run('DELETE FROM role_permissions WHERE role_id = ?', [roleRow.id]);
+    await run('DELETE FROM role_permissions WHERE role_id = ?', [roleRow.id]);
     for (const row of rows) {
       if (!allowed.has(row.code)) continue;
-      run('INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?, ?)', [
+      await run('INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?, ?)', [
         roleRow.id,
         row.id,
       ]);
@@ -125,12 +125,12 @@ function seedRbac(): void {
   }
 }
 
-function seedStatuses(): void {
+async function seedStatuses(): Promise<void> {
   const now = nowISO();
   for (const s of LEAD_STATUSES) {
-    const existing = get<{ id: number }>('SELECT id FROM lead_statuses WHERE code = ?', [s.code]);
+    const existing = await get<{ id: number }>('SELECT id FROM lead_statuses WHERE code = ?', [s.code]);
     if (existing) {
-      run('UPDATE lead_statuses SET name = ?, category = ?, color = ?, sort_order = ?, updated_at = ? WHERE id = ?', [
+      await run('UPDATE lead_statuses SET name = ?, category = ?, color = ?, sort_order = ?, updated_at = ? WHERE id = ?', [
         s.name,
         s.category,
         s.color,
@@ -139,7 +139,7 @@ function seedStatuses(): void {
         existing.id,
       ]);
     } else {
-      run(
+      await run(
         'INSERT INTO lead_statuses (code, name, category, color, is_active, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)',
         [s.code, s.name, s.category, s.color, s.sort, now, now],
       );
@@ -147,22 +147,22 @@ function seedStatuses(): void {
   }
 }
 
-function seedSources(): void {
+async function seedSources(): Promise<void> {
   const now = nowISO();
-  LEAD_SOURCES.forEach((name, index) => {
-    run(
+  for (const [index, name] of LEAD_SOURCES.entries()) {
+    await run(
       `INSERT INTO lead_sources (name, is_active, sort_order, created_at, updated_at)
        VALUES (?, 1, ?, ?, ?)
        ON CONFLICT(name) DO NOTHING`,
       [name, (index + 1) * 10, now, now],
     );
-  });
+  }
 }
 
-function seedSettings(): void {
+async function seedSettings(): Promise<void> {
   const now = nowISO();
   for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-    run(
+    await run(
       `INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
        ON CONFLICT(setting_key) DO NOTHING`,
       [key, JSON.stringify(value), now],
@@ -170,16 +170,16 @@ function seedSettings(): void {
   }
 }
 
-function seedAdmin(): void {
+async function seedAdmin(): Promise<void> {
   const now = nowISO();
-  const adminRole = get<{ id: number }>('SELECT id FROM roles WHERE code = ?', ['ADMIN']);
+  const adminRole = await get<{ id: number }>('SELECT id FROM roles WHERE code = ?', ['ADMIN']);
   if (!adminRole) return;
-  const existing = get<{ id: number }>(
+  const existing = await get<{ id: number }>(
     'SELECT id FROM users WHERE lower(email) = lower(?) AND deleted_at IS NULL',
     [config.admin.email],
   );
   if (existing) return;
-  run(
+  await run(
     `INSERT INTO users (name, email, phone, username, password_hash, role_id, status, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`,
     [
@@ -231,17 +231,17 @@ const DEMO_LEADS = [
 
 const TRAVEL_START = addDays(todayStr(), 21);
 
-function seedDemoData(): void {
+async function seedDemoData(): Promise<void> {
   if (!config.seedDemoData) return;
-  const already = get<{ value: string }>('SELECT value FROM settings WHERE setting_key = ?', ['demo_seeded']);
+  const already = await get<{ value: string }>('SELECT value FROM settings WHERE setting_key = ?', ['demo_seeded']);
   if (already) return;
 
   const now = nowISO();
-  const workerRole = get<{ id: number }>('SELECT id FROM roles WHERE code = ?', ['WORKER']);
-  const admin = get<{ id: number }>('SELECT id FROM users WHERE lower(email) = lower(?)', [config.admin.email]);
+  const workerRole = await get<{ id: number }>('SELECT id FROM roles WHERE code = ?', ['WORKER']);
+  const admin = await get<{ id: number }>('SELECT id FROM users WHERE lower(email) = lower(?)', [config.admin.email]);
   if (!workerRole || !admin) return;
 
-  tx(() => {
+  await tx(async () => {
     const workers: number[] = [];
     const demoWorkers = [
       { name: 'Rahul Verma', email: 'rahul@travelcrm.local', username: 'rahul', phone: '9000000001' },
@@ -249,12 +249,12 @@ function seedDemoData(): void {
       { name: 'Kavya Reddy', email: 'kavya@travelcrm.local', username: 'kavya', phone: '9000000003' },
     ];
     for (const w of demoWorkers) {
-      const existing = get<{ id: number }>('SELECT id FROM users WHERE lower(email) = lower(?)', [w.email]);
+      const existing = await get<{ id: number }>('SELECT id FROM users WHERE lower(email) = lower(?)', [w.email]);
       if (existing) {
         workers.push(existing.id);
         continue;
       }
-      const res = run(
+      const res = await run(
         `INSERT INTO users (name, email, phone, username, password_hash, role_id, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`,
         [w.name, w.email, w.phone, w.username, hashPassword('Worker@1234!'), workerRole.id, now, now],
@@ -264,7 +264,7 @@ function seedDemoData(): void {
 
     const customerIds: number[] = [];
     for (const c of DEMO_CUSTOMERS) {
-      const res = run(
+      const res = await run(
         `INSERT INTO customers (name, phone, whatsapp, email, city, state, country, notes, created_by, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [c.name, c.phone, c.whatsapp, c.email, c.city, c.state, c.country, null, admin.id, now, now],
@@ -272,17 +272,17 @@ function seedDemoData(): void {
       customerIds.push(res.lastInsertRowid);
     }
 
-    const sources = all<{ id: number; name: string }>('SELECT id, name FROM lead_sources WHERE is_active = 1');
+    const sources = await all<{ id: number; name: string }>('SELECT id, name FROM lead_sources WHERE is_active = 1');
     const sourceMap = new Map(sources.map((s) => [s.name, s.id]));
-    const statuses = all<{ id: number; code: string }>('SELECT id, code FROM lead_statuses');
+    const statuses = await all<{ id: number; code: string }>('SELECT id, code FROM lead_statuses');
     const statusMap = new Map(statuses.map((s) => [s.code, s.id]));
     const priorities = ['LOW', 'MEDIUM', 'HIGH', 'URGENT'];
 
-    DEMO_LEADS.forEach((l, i) => {
+    for (const [i, l] of DEMO_LEADS.entries()) {
       const customerId = customerIds[i % customerIds.length];
       const assignee = i % 7 === 3 ? null : workers[i % workers.length];
       const statusId = statusMap.get(l.status) ?? statusMap.get('NEW')!;
-      const leadRes = run(
+      const leadRes = await run(
         `INSERT INTO leads (lead_number, customer_id, source_id, assigned_to, destination, travel_type, trip_type,
            requirements, travel_start_date, travel_end_date, duration_days, adults, children, total_travelers,
            budget, currency, priority, status_id, last_contacted_at, next_follow_up_at, created_by, updated_by, created_at, updated_at)
@@ -316,17 +316,17 @@ function seedDemoData(): void {
       const leadId = leadRes.lastInsertRowid;
 
       if (assignee) {
-        run(
+        await run(
           `INSERT INTO lead_assignments (lead_id, assigned_to, assigned_by, action, assigned_at, is_active)
            VALUES (?, ?, ?, 'ASSIGNED', ?, 1)`,
           [leadId, assignee, admin.id, now],
         );
-        run(
+        await run(
           `INSERT INTO lead_timeline (lead_id, type, actor_id, summary, metadata, created_at)
            VALUES (?, 'LEAD_CREATED', ?, ?, '{}', ?)`,
           [leadId, admin.id, `Lead ${leadId} created`, now],
         );
-        run(
+        await run(
           `INSERT INTO lead_timeline (lead_id, type, actor_id, summary, metadata, created_at)
            VALUES (?, 'ASSIGNED', ?, ?, '{}', ?)`,
           [leadId, admin.id, 'Lead assigned', now],
@@ -337,7 +337,7 @@ function seedDemoData(): void {
         const offset = i % 5;
         const fuDate = offset === 0 ? todayStr() : offset === 1 ? addDays(todayStr(), -2) : addDays(todayStr(), offset - 1);
         const fuStatus = offset === 1 ? 'PENDING' : offset === 0 ? 'PENDING' : i % 6 === 0 ? 'CONVERTED' : 'COMPLETED';
-        run(
+        await run(
           `INSERT INTO follow_ups (lead_id, worker_id, scheduled_date, scheduled_time, type, status, notes,
              next_action, created_by, created_at, completed_by, completed_at, updated_at)
            VALUES (?, ?, ?, ?, 'Call', ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -358,13 +358,13 @@ function seedDemoData(): void {
         );
       }
 
-      run(
+      await run(
         `INSERT INTO notes (lead_id, author_id, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
         [leadId, admin.id, `Customer enquiry for ${l.dest}. Budget discussed: INR ${l.budget}.`, now, now],
       );
-    });
+    }
 
-    run(
+    await run(
       `INSERT INTO settings (setting_key, value, updated_at) VALUES ('demo_seeded', ?, ?)
        ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
       [JSON.stringify(true), now],
@@ -372,13 +372,13 @@ function seedDemoData(): void {
   });
 }
 
-export function seed(): void {
-  seedRbac();
-  seedStatuses();
-  seedSources();
-  seedSettings();
-  seedAdmin();
-  seedDemoData();
+export async function seed(): Promise<void> {
+  await seedRbac();
+  await seedStatuses();
+  await seedSources();
+  await seedSettings();
+  await seedAdmin();
+  await seedDemoData();
 }
 
 export function permissionCodes(): string[] {

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, likeTerm, nowISO, run } from '../../db/database.js';
+import { all, get, likeTerm, nowISO, run, tx } from '../../db/database.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/errors.js';
 import { buildMeta, created, list, meta, ok, pagination, toArray } from '../../lib/http.js';
 import { resolvePeriodDates, todayStr } from '../../lib/dates.js';
@@ -9,6 +9,7 @@ import { audit } from '../../services/audit.js';
 import { notify } from '../../services/notify.js';
 import { addTimelineEvent, TIMELINE_TYPES } from '../../services/timeline.js';
 import { loadLead, changeLeadStatus } from '../leads/leads.service.js';
+import { BOOKING_SELECT, shapeBooking } from '../bookings/bookings.routes.js';
 
 export const quotationsRouter = Router();
 
@@ -93,8 +94,8 @@ interface QuotationRow {
   [key: string]: any;
 }
 
-function loadQuotation(id: number, req: any): QuotationRow {
-  const row = get<QuotationRow>('SELECT * FROM quotations WHERE id = ? AND deleted_at IS NULL', [id]);
+async function loadQuotation(id: number, req: any): Promise<QuotationRow> {
+  const row = await get<QuotationRow>('SELECT * FROM quotations WHERE id = ? AND deleted_at IS NULL', [id]);
   if (!row) throw notFound('Quotation not found.');
   const user = req.user;
   if (!user) throw forbidden();
@@ -117,17 +118,17 @@ function assertQuotationWrite(q: QuotationRow, req: any): void {
   }
 }
 
-function nextQuotationNumber(): string {
+async function nextQuotationNumber(): Promise<string> {
   const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   const pattern = `QT-${stamp}-%`;
   for (let attempt = 0; attempt < 6; attempt++) {
-    const row = get<{ n: number }>(
+    const row = await get<{ n: number }>(
       `SELECT COALESCE(MAX(CAST(substr(quotation_number, length(?) + 1) AS INTEGER)), 0) AS n
        FROM quotations WHERE quotation_number LIKE ?`,
       [`QT-${stamp}-`, pattern],
     );
     const candidate = `QT-${stamp}-${String((row?.n ?? 0) + 1 + attempt).padStart(4, '0')}`;
-    if (!get('SELECT id FROM quotations WHERE quotation_number = ?', [candidate])) return candidate;
+    if (!await get('SELECT id FROM quotations WHERE quotation_number = ?', [candidate])) return candidate;
   }
   return `QT-${stamp}-${Date.now().toString().slice(-6)}`;
 }
@@ -163,8 +164,9 @@ function totalFromItems(items: z.infer<typeof itemSchema>[]): number {
 
 /* -------------------------------- LIST -------------------------------- */
 
-quotationsRouter.get('/', requireAuth, requireAuth, (req, res, next) => {
+quotationsRouter.get('/', requireAuth, async (req, res, next) => {
   try {
+    if (!can(req, 'quotations:read_all') && !can(req, 'quotations:read_own')) throw forbidden();
     const user = currentUser(req);
     const where: string[] = ['q.deleted_at IS NULL'];
     const params: unknown[] = [];
@@ -199,7 +201,7 @@ quotationsRouter.get('/', requireAuth, requireAuth, (req, res, next) => {
       where.push(
         `(q.quotation_number LIKE ? ESCAPE '\\' OR q.destination LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\' OR l.lead_number LIKE ? ESCAPE '\\')`,
       );
-      const term = likeTerm(search);
+      const term = await likeTerm(search);
       params.push(term, term, term, term);
     }
     const dates = resolvePeriodDates(
@@ -226,13 +228,13 @@ quotationsRouter.get('/', requireAuth, requireAuth, (req, res, next) => {
 
     const { page, limit, offset } = pagination(req.query, 20, 100);
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(
+    const total = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM quotations q
          JOIN customers c ON c.id = q.customer_id
          JOIN leads l ON l.id = q.lead_id ${whereSql}`,
       params,
-    )!.c;
-    const rows = all(`${QUOT_SELECT} ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`, [...params, limit, offset]);
+    ))!.c;
+    const rows = await all(`${QUOT_SELECT} ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`, [...params, limit, offset]);
     list(res, rows.map(shapeQuotation), buildMeta(page, limit, total));
   } catch (err) {
     next(err);
@@ -241,11 +243,11 @@ quotationsRouter.get('/', requireAuth, requireAuth, (req, res, next) => {
 
 /* ------------------------------- CREATE ------------------------------ */
 
-quotationsRouter.post('/', requireAuth, requirePermission('quotations:create'), (req, res, next) => {
+quotationsRouter.post('/', requireAuth, requirePermission('quotations:create'), async (req, res, next) => {
   try {
     const body = meta(createSchema, req.body);
     const user = currentUser(req);
-    const lead = loadLead(body.lead_id, req);
+    const lead = await loadLead(body.lead_id, req);
 
     let workerId = body.worker_id ?? lead.assigned_to ?? user.id;
     if (workerId !== user.id && !can(req, 'quotations:manage')) {
@@ -253,17 +255,17 @@ quotationsRouter.post('/', requireAuth, requirePermission('quotations:create'), 
         throw forbidden('You can only create quotations on leads assigned to you.');
       }
     }
-    const worker = get<{ status: string }>('SELECT status FROM users WHERE id = ? AND deleted_at IS NULL', [workerId]);
+    const worker = await get<{ status: string }>('SELECT status FROM users WHERE id = ? AND deleted_at IS NULL', [workerId]);
     if (!worker) throw badRequest('Selected worker does not exist.');
 
-    const now = nowISO();
-    const id = run(
+    const now = await nowISO();
+    const id = (await run(
       `INSERT INTO quotations (quotation_number, lead_id, customer_id, worker_id, destination, travel_start_date,
         travel_end_date, travelers, accommodation, transport, activities, inclusions, exclusions, items, currency,
         total_amount, notes, valid_until, status, status_history, created_by, updated_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', '[]', ?, ?, ?, ?)`,
       [
-        nextQuotationNumber(),
+        await nextQuotationNumber(),
         lead.id,
         lead.customer_id,
         workerId,
@@ -286,19 +288,19 @@ quotationsRouter.post('/', requireAuth, requirePermission('quotations:create'), 
         now,
         now,
       ],
-    ).lastInsertRowid;
+    )).lastInsertRowid;
 
-    addTimelineEvent({
+    await addTimelineEvent({
       leadId: lead.id,
       type: TIMELINE_TYPES.QUOTATION_CREATED,
       actorId: user.id,
-      summary: `Quotation created (${String(get<{ n: string }>('SELECT quotation_number AS n FROM quotations WHERE id = ?', [id])!.n)})`,
+      summary: `Quotation created (${String((await get<{ n: string }>('SELECT quotation_number AS n FROM quotations WHERE id = ?', [id]))!.n)})`,
       metadata: { quotation_id: id, total_amount: totalFromItems(body.items) },
     });
-    audit(req, 'QUOTATION_CREATED', 'quotation', id, { lead_id: lead.id, total: totalFromItems(body.items) });
+    await audit(req, 'QUOTATION_CREATED', 'quotation', id, { lead_id: lead.id, total: totalFromItems(body.items) });
 
     if (workerId !== user.id) {
-      notify({
+      await notify({
         userId: workerId,
         type: 'QUOTATION_ASSIGNED',
         title: `Quotation prepared for ${lead.lead_number}`,
@@ -309,7 +311,7 @@ quotationsRouter.post('/', requireAuth, requirePermission('quotations:create'), 
       });
     }
 
-    const row = get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
+    const row = await get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
     created(res, shapeQuotation(row!));
   } catch (err) {
     next(err);
@@ -318,11 +320,12 @@ quotationsRouter.post('/', requireAuth, requirePermission('quotations:create'), 
 
 /* ------------------------------- DETAIL ------------------------------ */
 
-quotationsRouter.get('/:id(\\d+)', requireAuth, requireAuth, (req, res, next) => {
+quotationsRouter.get('/:id(\\d+)', requireAuth, async (req, res, next) => {
   try {
+    if (!can(req, 'quotations:read_all') && !can(req, 'quotations:read_own')) throw forbidden();
     const id = Number(req.params.id);
-    loadQuotation(id, req);
-    const row = get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
+    await loadQuotation(id, req);
+    const row = await get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
     if (!row) throw notFound('Quotation not found.');
     ok(res, shapeQuotation(row));
   } catch (err) {
@@ -352,10 +355,10 @@ const patchSchema = z
 
 const CLOSED_STATUSES = ['ACCEPTED', 'REJECTED', 'CANCELLED', 'EXPIRED'];
 
-quotationsRouter.patch('/:id(\\d+)', requireAuth, requireAuth, (req, res, next) => {
+quotationsRouter.patch('/:id(\\d+)', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const q = loadQuotation(id, req);
+    const q = await loadQuotation(id, req);
     assertQuotationWrite(q, req);
     if (CLOSED_STATUSES.includes(q.status) && !can(req, 'quotations:manage')) {
       throw conflict(`A ${q.status.toLowerCase()} quotation cannot be edited.`);
@@ -399,11 +402,11 @@ quotationsRouter.patch('/:id(\\d+)', requireAuth, requireAuth, (req, res, next) 
     }
     if (!fields.length) throw badRequest('No changes supplied.');
     fields.push('updated_by = ?', 'updated_at = ?');
-    params.push(user.id, nowISO(), id);
-    run(`UPDATE quotations SET ${fields.join(', ')} WHERE id = ?`, params);
+    params.push(user.id, await nowISO(), id);
+    await run(`UPDATE quotations SET ${fields.join(', ')} WHERE id = ?`, params);
 
-    audit(req, 'QUOTATION_UPDATED', 'quotation', id, { fields: Object.keys(body) });
-    const row = get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
+    await audit(req, 'QUOTATION_UPDATED', 'quotation', id, { fields: Object.keys(body) });
+    const row = await get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
     ok(res, shapeQuotation(row!));
   } catch (err) {
     next(err);
@@ -417,10 +420,10 @@ const statusSchema = z.object({
   remark: z.string().trim().max(500).optional().nullable(),
 });
 
-quotationsRouter.post('/:id(\\d+)/status', requireAuth, requireAuth, (req, res, next) => {
+quotationsRouter.post('/:id(\\d+)/status', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const q = loadQuotation(id, req);
+    const q = await loadQuotation(id, req);
     assertQuotationWrite(q, req);
     const body = meta(statusSchema, req.body);
     const user = currentUser(req);
@@ -431,7 +434,7 @@ quotationsRouter.post('/:id(\\d+)/status', requireAuth, requireAuth, (req, res, 
       throw conflict(`Cannot move a ${q.status} quotation to ${body.status}.`, { allowed });
     }
 
-    const now = nowISO();
+    const now = await nowISO();
     const history = parseJson<Array<Record<string, any>>>(q.status_history, []);
     history.push({
       from: q.status,
@@ -442,7 +445,7 @@ quotationsRouter.post('/:id(\\d+)/status', requireAuth, requireAuth, (req, res, 
       remark: body.remark ?? null,
     });
 
-    run(
+    await run(
       `UPDATE quotations SET status = ?, status_history = ?, sent_at = COALESCE(sent_at, ?), accepted_at = ?,
          rejected_at = ?, updated_by = ?, updated_at = ? WHERE id = ?`,
       [
@@ -462,7 +465,7 @@ quotationsRouter.post('/:id(\\d+)/status', requireAuth, requireAuth, (req, res, 
         body.status === 'SENT'
           ? TIMELINE_TYPES.QUOTATION_SENT
           : TIMELINE_TYPES.QUOTATION_STATUS_CHANGED;
-      addTimelineEvent({
+      await addTimelineEvent({
         leadId: q.lead_id,
         type,
         actorId: user.id,
@@ -470,10 +473,10 @@ quotationsRouter.post('/:id(\\d+)/status', requireAuth, requireAuth, (req, res, 
         metadata: { quotation_id: id, from: q.status, to: body.status },
       });
     }
-    audit(req, 'QUOTATION_STATUS_CHANGED', 'quotation', id, { from: q.status, to: body.status, remark: body.remark ?? null });
+    await audit(req, 'QUOTATION_STATUS_CHANGED', 'quotation', id, { from: q.status, to: body.status, remark: body.remark ?? null });
 
     if (q.worker_id && q.worker_id !== user.id) {
-      notify({
+      await notify({
         userId: q.worker_id,
         type: 'QUOTATION_STATUS_CHANGED',
         title: `${q.quotation_number} is now ${body.status}`,
@@ -484,7 +487,7 @@ quotationsRouter.post('/:id(\\d+)/status', requireAuth, requireAuth, (req, res, 
       });
     }
 
-    const row = get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
+    const row = await get(`${QUOT_SELECT} WHERE q.id = ?`, [id]);
     ok(res, shapeQuotation(row!));
   } catch (err) {
     next(err);
@@ -497,82 +500,88 @@ quotationsRouter.post('/:id(\\d+)/status', requireAuth, requireAuth, (req, res, 
  * Accepted quotation → booking. One click, same data, no re-typing; the lead
  * moves to CONVERTED so the pipeline reflects reality.
  */
-quotationsRouter.post('/:id(\\d+)/convert', requireAuth, requirePermission('bookings:create'), (req, res, next) => {
+quotationsRouter.post('/:id(\\d+)/convert', requireAuth, requirePermission('bookings:create'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const q = loadQuotation(id, req);
+    const q = await loadQuotation(id, req);
     const user = currentUser(req);
 
     if (q.status !== 'ACCEPTED') throw conflict('Only an accepted quotation can be converted to a booking.');
-    const already = get<{ id: number; booking_number: string }>(
-      'SELECT id, booking_number FROM bookings WHERE quotation_id = ? AND deleted_at IS NULL',
-      [id],
-    );
-    if (already) throw conflict('This quotation has already been converted.', { booking_id: already.id });
 
-    const now = nowISO();
-    const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     let bookingNumber = '';
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const candidate = `BK-${stamp}-${String(attempt + 1).padStart(4, '0')}`;
-      if (!get('SELECT id FROM bookings WHERE booking_number = ?', [candidate])) {
-        bookingNumber = candidate;
-        break;
+    const bookingId = await tx(async () => {
+      const already = await get<{ id: number; booking_number: string }>(
+        'SELECT id, booking_number FROM bookings WHERE quotation_id = ? AND deleted_at IS NULL',
+        [id],
+      );
+      if (already) throw conflict('This quotation has already been converted.', { booking_id: already.id });
+
+      const now = await nowISO();
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const candidate = `BK-${stamp}-${String(attempt + 1).padStart(4, '0')}`;
+        if (!await get('SELECT id FROM bookings WHERE booking_number = ?', [candidate])) {
+          bookingNumber = candidate;
+          break;
+        }
       }
-    }
-    if (!bookingNumber) bookingNumber = `BK-${stamp}-${Date.now().toString().slice(-6)}`;
+      if (!bookingNumber) bookingNumber = `BK-${stamp}-${Date.now().toString().slice(-6)}`;
 
-    const bookingId = run(
-      `INSERT INTO bookings (booking_number, lead_id, customer_id, quotation_id, worker_id, destination,
-        travel_start_date, travel_end_date, travelers, currency, total_amount, paid_amount, payment_status,
-        status, status_history, notes, booked_at, created_by, updated_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'UNPAID', 'CONFIRMED', ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        bookingNumber,
-        q.lead_id,
-        q.customer_id,
-        q.id,
-        q.worker_id,
-        q.destination ?? null,
-        q.travel_start_date ?? null,
-        q.travel_end_date ?? null,
-        q.travelers ?? null,
-        q.currency ?? 'INR',
-        Number(q.total_amount ?? 0),
-        JSON.stringify([{ from: 'PENDING', to: 'CONFIRMED', at: now, by: user.id, reason: 'Converted from quotation' }]),
-        q.notes ?? null,
-        now,
-        user.id,
-        user.id,
-        now,
-        now,
-      ],
-    ).lastInsertRowid;
+      const newId = Number(
+        (await run(
+          `INSERT INTO bookings (booking_number, lead_id, customer_id, quotation_id, worker_id, destination,
+            travel_start_date, travel_end_date, travelers, currency, total_amount, paid_amount, payment_status,
+            status, status_history, notes, booked_at, created_by, updated_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'UNPAID', 'CONFIRMED', ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            bookingNumber,
+            q.lead_id,
+            q.customer_id,
+            q.id,
+            q.worker_id,
+            q.destination ?? null,
+            q.travel_start_date ?? null,
+            q.travel_end_date ?? null,
+            q.travelers ?? null,
+            q.currency ?? 'INR',
+            Number(q.total_amount ?? 0),
+            JSON.stringify([{ from: 'PENDING', to: 'CONFIRMED', at: now, by: user.id, reason: 'Converted from quotation' }]),
+            q.notes ?? null,
+            now,
+            user.id,
+            user.id,
+            now,
+            now,
+          ],
+        )).lastInsertRowid,
+      );
 
-    if (q.lead_id) {
-      addTimelineEvent({
-        leadId: q.lead_id,
-        type: TIMELINE_TYPES.BOOKING_CREATED,
-        actorId: user.id,
-        summary: `Booking ${bookingNumber} created from ${q.quotation_number}`,
-        metadata: { booking_id: bookingId, quotation_id: id },
-      });
-      const lead = get<{ status_id: number }>('SELECT status_id FROM leads WHERE id = ?', [q.lead_id]);
-      const converted = get<{ id: number }>(`SELECT id FROM lead_statuses WHERE code = 'CONVERTED'`);
-      if (lead && converted && lead.status_id !== converted.id) {
-        changeLeadStatus({
+      if (q.lead_id) {
+        await addTimelineEvent({
           leadId: q.lead_id,
-          toCode: 'CONVERTED',
+          type: TIMELINE_TYPES.BOOKING_CREATED,
           actorId: user.id,
-          remark: `Booking ${bookingNumber}`,
-          silent: true,
+          summary: `Booking ${bookingNumber} created from ${q.quotation_number}`,
+          metadata: { booking_id: newId, quotation_id: id },
         });
+        const lead = await get<{ status_id: number }>('SELECT status_id FROM leads WHERE id = ?', [q.lead_id]);
+        const converted = await get<{ id: number }>(`SELECT id FROM lead_statuses WHERE code = 'CONVERTED'`);
+        if (lead && converted && lead.status_id !== converted.id) {
+          await changeLeadStatus({
+            leadId: q.lead_id,
+            toCode: 'CONVERTED',
+            actorId: user.id,
+            remark: `Booking ${bookingNumber}`,
+            silent: true,
+          });
+        }
       }
-    }
-    audit(req, 'BOOKING_CREATED', 'booking', bookingId, { quotation_id: id, lead_id: q.lead_id, booking_number: bookingNumber });
+      await audit(req, 'BOOKING_CREATED', 'booking', newId, { quotation_id: id, lead_id: q.lead_id, booking_number: bookingNumber });
+      return newId;
+    });
 
     if (q.worker_id && q.worker_id !== user.id) {
-      notify({
+      await notify({
         userId: q.worker_id,
         type: 'BOOKING_CREATED',
         title: `Booking ${bookingNumber} created`,
@@ -583,8 +592,8 @@ quotationsRouter.post('/:id(\\d+)/convert', requireAuth, requirePermission('book
       });
     }
 
-    const row = get('SELECT * FROM bookings WHERE id = ?', [bookingId]);
-    created(res, { booking_id: bookingId, booking_number: bookingNumber, data: row });
+    const row = await get<Record<string, any>>(`${BOOKING_SELECT} WHERE b.id = ?`, [bookingId]);
+    created(res, { booking_id: bookingId, booking_number: bookingNumber, data: row ? shapeBooking(row) : null });
   } catch (err) {
     next(err);
   }
@@ -593,11 +602,12 @@ quotationsRouter.post('/:id(\\d+)/convert', requireAuth, requirePermission('book
 /* ------------------------------- STATS ------------------------------- */
 
 /** Counts per status for list headers and dashboards. */
-quotationsRouter.get('/stats/summary', requireAuth, requireAuth, (req, res, next) => {
+quotationsRouter.get('/stats/summary', requireAuth, async (req, res, next) => {
   try {
+    if (!can(req, 'quotations:read_all') && !can(req, 'quotations:read_own')) throw forbidden();
     const user = currentUser(req);
     const scopeSelf = !can(req, 'quotations:read_all');
-    const rows = all<{ status: string; c: number; amount: number }>(
+    const rows = await all<{ status: string; c: number; amount: number }>(
       `SELECT status, COUNT(*) AS c, COALESCE(SUM(total_amount), 0) AS amount
        FROM quotations
        WHERE deleted_at IS NULL ${scopeSelf ? 'AND (worker_id = ? OR created_by = ?)' : ''}
@@ -606,13 +616,13 @@ quotationsRouter.get('/stats/summary', requireAuth, requireAuth, (req, res, next
     );
     const byStatus: Record<string, { count: number; amount: number }> = {};
     for (const r of rows) byStatus[r.status] = { count: Number(r.c), amount: Number(r.amount) };
-    const expiring = get<{ c: number }>(
+    const expiring = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM quotations
        WHERE deleted_at IS NULL AND status IN ('SENT','VIEWED','NEGOTIATION')
          AND valid_until IS NOT NULL AND valid_until >= ? AND valid_until <= date('now', '+7 day')
          ${scopeSelf ? 'AND (worker_id = ? OR created_by = ?)' : ''}`,
       scopeSelf ? [todayStr(), user.id, user.id] : [todayStr()],
-    )!.c;
+    ))!.c;
     ok(res, { by_status: byStatus, expiring_in_7_days: expiring });
   } catch (err) {
     next(err);

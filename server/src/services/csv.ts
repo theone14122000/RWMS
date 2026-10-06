@@ -66,7 +66,7 @@ export function toCsv(rows: Array<Array<string | number | null | undefined>>): s
           let value = cell === null || cell === undefined ? '' : String(cell);
           // Neutralise spreadsheet formula injection when the file is opened in Excel/Sheets.
           const isNumeric = /^-?\d+(\.\d+)?$/.test(value);
-          if (!isNumeric && /^[=+@\-]/.test(value)) value = `'${value}`;
+          if (!isNumeric && /^[=+@\-\t\r]/.test(value)) value = `'${value}`;
           return /["\n\r,]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
         })
         .join(','),

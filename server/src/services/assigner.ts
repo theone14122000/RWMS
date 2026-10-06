@@ -19,32 +19,34 @@ interface Candidate {
   skills: string[];
 }
 
-function activeWorkers(): Candidate[] {
-  const rows = all<{ id: number; name: string; skills: string | null }>(
+async function activeWorkers(): Promise<Candidate[]> {
+  const rows = await all<{ id: number; name: string; skills: string | null }>(
     `SELECT u.id, u.name, u.skills FROM users u
      JOIN roles r ON r.id = u.role_id
      WHERE r.code = 'WORKER' AND u.status = 'ACTIVE' AND u.deleted_at IS NULL
      ORDER BY u.id ASC`,
   );
-  return rows.map((row) => {
-    let skills: string[] = [];
-    try {
-      const parsed = JSON.parse(row.skills ?? '[]');
-      if (Array.isArray(parsed)) skills = parsed.map(String);
-    } catch {
-      skills = [];
-    }
-    return { id: row.id, name: row.name, open_leads: openLeadCount(row.id), skills };
-  });
+  return await Promise.all(
+    rows.map(async (row) => {
+      let skills: string[] = [];
+      try {
+        const parsed = JSON.parse(row.skills ?? '[]');
+        if (Array.isArray(parsed)) skills = parsed.map(String);
+      } catch {
+        skills = [];
+      }
+      return { id: row.id, name: row.name, open_leads: await openLeadCount(row.id), skills };
+    }),
+  );
 }
 
-function openLeadCount(workerId: number): number {
+async function openLeadCount(workerId: number): Promise<number> {
   return (
-    get<{ c: number }>(
+    (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM leads l JOIN lead_statuses s ON s.id = l.status_id
        WHERE l.assigned_to = ? AND l.deleted_at IS NULL AND s.category = 'OPEN'`,
       [workerId],
-    )?.c ?? 0
+    ))?.c ?? 0
   );
 }
 
@@ -86,13 +88,14 @@ function skillsForLead(lead: Partial<LeadRow>): string[] {
 }
 
 /** Pure decision function — returns the chosen worker id (or null). */
-export function pickWorker(lead: Partial<LeadRow>, cfg: AssignmentConfig = assignmentConfig()): number | null {
-  const workers = activeWorkers();
+export async function pickWorker(lead: Partial<LeadRow>, cfg?: AssignmentConfig): Promise<number | null> {
+  cfg = cfg ?? (await assignmentConfig());
+  const workers = await activeWorkers();
   if (!workers.length) return null;
 
   switch (cfg.strategy) {
     case 'ROUND_ROBIN':
-      return nextRoundRobin(workers.map((w) => w.id));
+      return await nextRoundRobin(workers.map((w) => w.id));
 
     case 'WORKLOAD':
       return leastLoaded(workers)[0]?.id ?? null;
@@ -128,22 +131,22 @@ export interface AutoAssignResult {
  * Assigns a single unassigned lead using the configured strategy.
  * Never overwrites an existing owner (ownership never changes silently).
  */
-export function autoAssignLead(opts: {
+export async function autoAssignLead(opts: {
   lead: LeadRow;
   actorId: number;
   actorName: string;
   strategy?: string;
-}): AutoAssignResult {
-  const cfg = assignmentConfig();
+}): Promise<AutoAssignResult> {
+  const cfg = await assignmentConfig();
   const strategy = opts.strategy ?? cfg.strategy;
   if (strategy === 'MANUAL') return { changed: false, strategy, to: null, reason: null };
   if (opts.lead.assigned_to) return { changed: false, strategy, to: opts.lead.assigned_to, reason: null };
 
-  const picked = pickWorker(opts.lead, { ...cfg, strategy: strategy as AssignmentConfig['strategy'] });
+  const picked = await pickWorker(opts.lead, { ...cfg, strategy: strategy as AssignmentConfig['strategy'] });
   if (!picked) return { changed: false, strategy, to: null, reason: null };
 
   const reason = `auto:${strategy.toLowerCase()}`;
-  const res = assignLead({
+  const res = await assignLead({
     lead: opts.lead,
     toUserId: picked,
     actorId: opts.actorId,
@@ -154,17 +157,17 @@ export function autoAssignLead(opts: {
 }
 
 /** Sweeps unassigned leads — used by the automation trigger and tests. */
-export function autoAssignPending(opts: { actorId: number; actorName: string }): {
+export async function autoAssignPending(opts: { actorId: number; actorName: string }): Promise<{
   assigned: number;
   strategy: string;
-} {
-  const cfg = assignmentConfig();
+}> {
+  const cfg = await assignmentConfig();
   if (cfg.strategy === 'MANUAL') return { assigned: 0, strategy: cfg.strategy };
-  const rows = all<LeadRow>('SELECT * FROM leads WHERE assigned_to IS NULL AND deleted_at IS NULL ORDER BY id ASC LIMIT 500');
+  const rows = await all<LeadRow>('SELECT * FROM leads WHERE assigned_to IS NULL AND deleted_at IS NULL ORDER BY id ASC LIMIT 500');
   let assigned = 0;
   for (const lead of rows) {
     try {
-      const res = autoAssignLead({ lead, actorId: opts.actorId, actorName: opts.actorName });
+      const res = await autoAssignLead({ lead, actorId: opts.actorId, actorName: opts.actorName });
       if (res.changed) assigned += 1;
     } catch (err) {
       console.error('[assigner] failed for lead', lead.id, (err as Error).message);

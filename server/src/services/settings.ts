@@ -1,8 +1,8 @@
 import { all, get, nowISO, run } from '../db/database.js';
 
 /** Reads a JSON settings row, falling back when missing or malformed. */
-export function readSetting<T>(key: string, fallback: T): T {
-  const row = get<{ value: string }>('SELECT value FROM settings WHERE setting_key = ?', [key]);
+export async function readSetting<T>(key: string, fallback: T): Promise<T> {
+  const row = await get<{ value: string }>('SELECT value FROM settings WHERE setting_key = ?', [key]);
   if (!row) return fallback;
   try {
     return JSON.parse(row.value) as T;
@@ -11,16 +11,16 @@ export function readSetting<T>(key: string, fallback: T): T {
   }
 }
 
-export function writeSetting(key: string, value: unknown): void {
-  run(
+export async function writeSetting(key: string, value: unknown): Promise<void> {
+  await run(
     `INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    [key, JSON.stringify(value), nowISO()],
+    [key, JSON.stringify(value), await nowISO()],
   );
 }
 
-export function readAllSettings(): Record<string, unknown> {
-  const rows = all<{ setting_key: string; value: string }>('SELECT setting_key, value FROM settings');
+export async function readAllSettings(): Promise<Record<string, unknown>> {
+  const rows = await all<{ setting_key: string; value: string }>('SELECT setting_key, value FROM settings');
   const out: Record<string, unknown> = {};
   for (const row of rows) {
     try {
@@ -92,8 +92,8 @@ const ASSIGNMENT_FALLBACK: AssignmentConfig = {
   destination_rules: [],
 };
 
-export function assignmentConfig(): AssignmentConfig {
-  const raw = readSetting<Partial<AssignmentConfig> | null>('assignment', null);
+export async function assignmentConfig(): Promise<AssignmentConfig> {
+  const raw = await readSetting<Partial<AssignmentConfig> | null>('assignment', null);
   if (!raw) return { ...ASSIGNMENT_FALLBACK, destination_rules: [] };
   return {
     strategy: (raw.strategy as AssignmentStrategy) ?? 'MANUAL',
@@ -102,8 +102,8 @@ export function assignmentConfig(): AssignmentConfig {
   };
 }
 
-export function callPolicy(): CallPolicy {
-  const raw = readSetting<Partial<CallPolicy> | null>('call_policy', null);
+export async function callPolicy(): Promise<CallPolicy> {
+  const raw = await readSetting<Partial<CallPolicy> | null>('call_policy', null);
   return {
     recording_mode: raw?.recording_mode ?? 'PROVIDER_DEFAULT',
     consent_notice: raw?.consent_notice ?? '',
@@ -111,8 +111,8 @@ export function callPolicy(): CallPolicy {
   };
 }
 
-export function telephonyConfig(): TelephonyConfig {
-  const raw = readSetting<Partial<TelephonyConfig> | null>('telephony', null);
+export async function telephonyConfig(): Promise<TelephonyConfig> {
+  const raw = await readSetting<Partial<TelephonyConfig> | null>('telephony', null);
   return {
     provider: raw?.provider ?? 'none',
     base_url: String(raw?.base_url ?? '').trim(),
@@ -122,8 +122,8 @@ export function telephonyConfig(): TelephonyConfig {
   };
 }
 
-export function channelConfig(channel: 'WHATSAPP' | 'EMAIL' | 'SMS'): ChannelConfig {
-  const all_ = readSetting<Record<string, Partial<ChannelConfig>>>('communication_providers', {});
+export async function channelConfig(channel: 'WHATSAPP' | 'EMAIL' | 'SMS'): Promise<ChannelConfig> {
+  const all_ = await readSetting<Record<string, Partial<ChannelConfig>>>('communication_providers', {});
   const raw = all_?.[channel.toLowerCase()] ?? {};
   return {
     provider: raw.provider ?? 'none',
@@ -132,8 +132,8 @@ export function channelConfig(channel: 'WHATSAPP' | 'EMAIL' | 'SMS'): ChannelCon
   };
 }
 
-export function aiConfig(): AiConfig {
-  const raw = readSetting<Partial<AiConfig> | null>('ai', null);
+export async function aiConfig(): Promise<AiConfig> {
+  const raw = await readSetting<Partial<AiConfig> | null>('ai', null);
   return {
     provider: raw?.provider ?? 'none',
     base_url: String(raw?.base_url ?? '').trim(),
@@ -143,8 +143,8 @@ export function aiConfig(): AiConfig {
   };
 }
 
-export function retentionConfig(): RetentionConfig {
-  const raw = readSetting<Partial<RetentionConfig> | null>('retention', null);
+export async function retentionConfig(): Promise<RetentionConfig> {
+  const raw = await readSetting<Partial<RetentionConfig> | null>('retention', null);
   return {
     call_recordings_days: Number(raw?.call_recordings_days ?? 0) || 0,
     communications_days: Number(raw?.communications_days ?? 0) || 0,
@@ -153,7 +153,7 @@ export function retentionConfig(): RetentionConfig {
   };
 }
 
-export function reminderConfig(): ReminderConfig {
-  const raw = readSetting<Partial<ReminderConfig> | null>('reminders', null);
+export async function reminderConfig(): Promise<ReminderConfig> {
+  const raw = await readSetting<Partial<ReminderConfig> | null>('reminders', null);
   return { enabled: raw?.enabled !== false, overdue_enabled: raw?.overdue_enabled !== false };
 }

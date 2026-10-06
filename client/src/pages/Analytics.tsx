@@ -174,7 +174,7 @@ function Overview({ period }: { period: string }) {
         </div>
       </div>
 
-      <div className="kpi-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+      <div className="kpi-grid kpi-2">
         <div className="card">
           <div className="card-head"><h3>Calls per bucket</h3></div>
           <div className="card-body stack" style={{ gap: 7 }}>
@@ -301,7 +301,7 @@ function WorkerDetail({ id, period }: { id: number; period: string }) {
         <span className="small muted">{d.worker.email}</span>
       </div>
 
-      <div className="kpi-grid" style={{ gridTemplateColumns: '1fr 1fr 1fr' }}>
+      <div className="kpi-grid kpi-3">
         {metricCards(d.metrics).map((m) => (
           <div key={m.label} className={`kpi${m.accent ? ` accent-${m.accent}` : ''}`}>
             <div className="label">{m.label}</div>

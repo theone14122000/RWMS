@@ -85,7 +85,7 @@ export default function Automation() {
         </div>
       </div>
 
-      <div className="kpi-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))' }}>
+      <div className="kpi-grid">
         {countCards.map((c) => (
           <div key={c.key} className={`kpi${counts[c.key] > 0 && c.danger ? ' accent-red' : ''}`}>
             <div className="label">{c.label}</div>
@@ -94,7 +94,7 @@ export default function Automation() {
         ))}
       </div>
 
-      <div className="kpi-grid" style={{ gridTemplateColumns: '1fr 1fr 1fr' }}>
+      <div className="kpi-grid kpi-3">
         <div className={`kpi${d.scheduler_enabled ? ' accent-green' : ''}`}>
           <div className="label">Scheduler</div>
           <div className="value" style={{ fontSize: 17 }}>{d.scheduler_enabled ? 'Running' : 'Stopped'}</div>

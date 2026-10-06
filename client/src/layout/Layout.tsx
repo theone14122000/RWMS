@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
 import { useQuery } from '../lib/useQuery';
-import { post } from '../api/client';
+import { patch, post } from '../api/client';
 import { Avatar } from '../ui/atoms';
+import { useToast } from '../ui/Toast';
 
 interface NotificationRow {
   id: number;
@@ -22,6 +23,7 @@ const TITLES: Array<[RegExp, string]> = [
   [/^\/calls/, 'Calls & recordings'],
   [/^\/quotations/, 'Quotations'],
   [/^\/bookings/, 'Bookings'],
+  [/^\/invoices/, 'Invoices'],
   [/^\/reports/, 'Reports & data'],
   [/^\/analytics/, 'Analytics'],
   [/^\/automation/, 'Automation'],
@@ -38,6 +40,7 @@ export default function Layout() {
   const { user, logout, can } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
+  const toast = useToast();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
@@ -74,6 +77,7 @@ export default function Layout() {
     { to: '/calls', label: 'Calls', icon: '☎', show: can('calls:read_all') || can('calls:read_own') },
     { to: '/quotations', label: 'Quotations', icon: '✎', show: can('quotations:read_all') || can('quotations:read_own') },
     { to: '/bookings', label: 'Bookings', icon: '✈', show: can('bookings:read_all') || can('bookings:read_own') },
+    { to: '/invoices', label: 'Invoices', icon: '§', show: can('invoices:read_all') || can('invoices:read_own') },
     { to: '/customers', label: 'Customers', icon: '☺', show: can('customers:read_all') || can('customers:read_own') },
     { to: '/reports', label: 'Reports & data', icon: '⇩', show: can('reports:read') || can('exports:run') },
     { to: '/analytics', label: 'Analytics', icon: '◔', show: can('analytics:read') },
@@ -174,8 +178,12 @@ export default function Layout() {
                       type="button"
                       className="btn btn-ghost btn-sm"
                       onClick={async () => {
-                        await post('/api/notifications/read-all');
-                        reloadNotifs();
+                        try {
+                          await post('/api/notifications/read-all');
+                          reloadNotifs();
+                        } catch {
+                          toast.push('error', 'Could not mark notifications as read');
+                        }
                       }}
                     >
                       Mark all read
@@ -199,8 +207,12 @@ export default function Layout() {
                         }}
                         onClick={async () => {
                           if (!n.read_at) {
-                            await post(`/api/notifications/${n.id}/read`);
-                            reloadNotifs();
+                            try {
+                              await patch(`/api/notifications/${n.id}/read`);
+                              reloadNotifs();
+                            } catch {
+                              toast.push('error', 'Could not mark the notification as read');
+                            }
                           }
                           if (n.link) {
                             navigate(n.link);
@@ -242,6 +254,17 @@ export default function Layout() {
                     <span className="badge badge-blue">{isAdmin ? 'ADMIN' : 'WORKER'}</span>
                   </div>
                 </div>
+                <button
+                  type="button"
+                  className="nav-item"
+                  style={{ margin: 6, color: 'var(--text-2)' }}
+                  onClick={() => {
+                    setUserOpen(false);
+                    navigate('/profile');
+                  }}
+                >
+                  <span className="icon">☺</span> My profile
+                </button>
                 <button
                   type="button"
                   className="nav-item"

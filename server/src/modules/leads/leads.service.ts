@@ -44,8 +44,8 @@ export interface LeadRow {
 }
 
 /** Fetches a lead and enforces server-side access for the caller. */
-export function loadLead(leadId: number, req: { user?: { id: number; permissions: string[] } }): LeadRow {
-  const lead = get<LeadRow>('SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL', [leadId]);
+export async function loadLead(leadId: number, req: { user?: { id: number; permissions: string[] } }): Promise<LeadRow> {
+  const lead = await get<LeadRow>('SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL', [leadId]);
   if (!lead) throw notFound('Lead not found.');
   const user = req.user;
   if (!user) throw forbidden();
@@ -64,20 +64,20 @@ export function assertLeadWriteAccess(lead: LeadRow, req: { user?: { id: number;
   throw forbidden('You do not have permission to modify this lead.');
 }
 
-export function nextLeadNumber(): string {
-  const prefix = get<{ value: string }>('SELECT value FROM settings WHERE setting_key = ?', ['lead_number_prefix']);
+export async function nextLeadNumber(): Promise<string> {
+  const prefix = await get<{ value: string }>('SELECT value FROM settings WHERE setting_key = ?', ['lead_number_prefix']);
   const base = safeJson(prefix?.value, 'LD') as string;
   const stamp = new Date().toISOString().slice(0, 7).replace('-', '');
   const pattern = `${base}-${stamp}-%`;
   for (let attempt = 0; attempt < 5; attempt++) {
-    const row = get<{ n: number }>(
+    const row = await get<{ n: number }>(
       `SELECT COALESCE(MAX(CAST(substr(lead_number, length(?) + 1) AS INTEGER)), 0) AS n
        FROM leads WHERE lead_number LIKE ?`,
       [`${base}-${stamp}-`, pattern],
     );
     const next = (row?.n ?? 0) + 1 + attempt;
     const candidate = `${base}-${stamp}-${String(next).padStart(4, '0')}`;
-    const clash = get('SELECT id FROM leads WHERE lead_number = ?', [candidate]);
+    const clash = await get('SELECT id FROM leads WHERE lead_number = ?', [candidate]);
     if (!clash) return candidate;
   }
   return `${base}-${stamp}-${Date.now().toString().slice(-6)}`;
@@ -107,14 +107,14 @@ export interface AssignResult {
 }
 
 /** Assigns / reassigns a lead while preserving the full assignment history. */
-export function assignLead(opts: AssignOptions): AssignResult {
+export async function assignLead(opts: AssignOptions): Promise<AssignResult> {
   const { lead, toUserId, actorId } = opts;
   const from = lead.assigned_to;
 
   if ((from ?? null) === (toUserId ?? null)) return { changed: false, from, to: toUserId };
 
   if (toUserId !== null) {
-    const target = get<{ id: number; name: string; status: string }>(
+    const target = await get<{ id: number; name: string; status: string }>(
       'SELECT id, name, status FROM users WHERE id = ? AND deleted_at IS NULL',
       [toUserId],
     );
@@ -122,15 +122,15 @@ export function assignLead(opts: AssignOptions): AssignResult {
     if (target.status !== 'ACTIVE') throw badRequest('Selected worker is not active.');
   }
 
-  const now = nowISO();
+  const now = await nowISO();
 
-  run('UPDATE lead_assignments SET is_active = 0, released_at = ? WHERE lead_id = ? AND is_active = 1', [
+  await run('UPDATE lead_assignments SET is_active = 0, released_at = ? WHERE lead_id = ? AND is_active = 1', [
     now,
     lead.id,
   ]);
 
   if (toUserId !== null) {
-    run(
+    await run(
       `INSERT INTO lead_assignments (lead_id, assigned_to, assigned_by, action, reason, assigned_at, is_active)
        VALUES (?, ?, ?, ?, ?, ?, 1)`,
       [
@@ -144,7 +144,7 @@ export function assignLead(opts: AssignOptions): AssignResult {
     );
   }
 
-  run('UPDATE leads SET assigned_to = ?, updated_at = ?, updated_by = ? WHERE id = ?', [
+  await run('UPDATE leads SET assigned_to = ?, updated_at = ?, updated_by = ? WHERE id = ?', [
     toUserId,
     now,
     actorId,
@@ -155,10 +155,10 @@ export function assignLead(opts: AssignOptions): AssignResult {
   const targetName =
     toUserId === null
       ? 'Unassigned'
-      : get<{ name: string }>('SELECT name FROM users WHERE id = ?', [toUserId])?.name ?? `#${toUserId}`;
-  const fromName = from ? (get<{ name: string }>('SELECT name FROM users WHERE id = ?', [from])?.name ?? `#${from}`) : 'Unassigned';
+      : (await get<{ name: string }>('SELECT name FROM users WHERE id = ?', [toUserId]))?.name ?? `#${toUserId}`;
+  const fromName = from ? ((await get<{ name: string }>('SELECT name FROM users WHERE id = ?', [from]))?.name ?? `#${from}`) : 'Unassigned';
 
-  addTimelineEvent({
+  await addTimelineEvent({
     leadId: lead.id,
     type,
     actorId,
@@ -172,7 +172,7 @@ export function assignLead(opts: AssignOptions): AssignResult {
   });
 
   if (toUserId !== null && toUserId !== actorId) {
-    notify({
+    await notify({
       userId: toUserId,
       type: 'LEAD_ASSIGNED',
       title: `New lead assigned: ${lead.lead_number}`,
@@ -184,9 +184,9 @@ export function assignLead(opts: AssignOptions): AssignResult {
   }
 
   // Auto-promote NEW leads to ASSIGNED so the pipeline reflects reality.
-  const status = get<{ code: string }>('SELECT code FROM lead_statuses WHERE id = ?', [lead.status_id]);
+  const status = await get<{ code: string }>('SELECT code FROM lead_statuses WHERE id = ?', [lead.status_id]);
   if (toUserId !== null && status?.code === 'NEW') {
-    changeLeadStatus({ leadId: lead.id, toCode: 'ASSIGNED', actorId, silent: false });
+    await changeLeadStatus({ leadId: lead.id, toCode: 'ASSIGNED', actorId, silent: false });
   }
 
   return { changed: true, from, to: toUserId };
@@ -200,32 +200,32 @@ export interface StatusChangeOptions {
   silent?: boolean;
 }
 
-export function changeLeadStatus(opts: StatusChangeOptions): { from: string; to: string } | null {
-  const lead = get<LeadRow>('SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL', [opts.leadId]);
+export async function changeLeadStatus(opts: StatusChangeOptions): Promise<{ from: string; to: string } | null> {
+  const lead = await get<LeadRow>('SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL', [opts.leadId]);
   if (!lead) throw notFound('Lead not found.');
 
-  const to = get<{ id: number; code: string; is_active: number }>(
+  const to = await get<{ id: number; code: string; is_active: number }>(
     'SELECT id, code, is_active FROM lead_statuses WHERE code = ?',
     [opts.toCode],
   );
   if (!to) throw badRequest('Unknown lead status.');
   if (to.is_active !== 1) throw badRequest('This lead status is disabled.');
 
-  const current = get<{ id: number; code: string }>('SELECT id, code FROM lead_statuses WHERE id = ?', [lead.status_id]);
+  const current = await get<{ id: number; code: string }>('SELECT id, code FROM lead_statuses WHERE id = ?', [lead.status_id]);
   if (!current || current.id === to.id) return null;
 
-  const now = nowISO();
-  run('UPDATE leads SET status_id = ?, updated_at = ?, updated_by = ? WHERE id = ?', [
+  const now = await nowISO();
+  await run('UPDATE leads SET status_id = ?, updated_at = ?, updated_by = ? WHERE id = ?', [
     to.id,
     now,
     opts.actorId,
     opts.leadId,
   ]);
-  run(
+  await run(
     'INSERT INTO lead_status_history (lead_id, from_status_id, to_status_id, changed_by, remark, changed_at) VALUES (?, ?, ?, ?, ?, ?)',
     [opts.leadId, current.id, to.id, opts.actorId, opts.remark ?? null, now],
   );
-  addTimelineEvent({
+  await addTimelineEvent({
     leadId: opts.leadId,
     type: TIMELINE_TYPES.STATUS_CHANGED,
     actorId: opts.actorId,

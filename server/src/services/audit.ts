@@ -3,15 +3,15 @@ import { run } from '../db/database.js';
 
 type Meta = Record<string, unknown>;
 
-export function audit(
+export async function audit(
   req: Request | undefined,
   action: string,
   entity: string,
   entityId: string | number | null | undefined,
   metadata: Meta = {},
-): void {
+): Promise<void> {
   try {
-    run(
+    await run(
       'INSERT INTO audit_logs (user_id, action, entity, entity_id, metadata, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [
         req?.user?.id ?? null,
@@ -28,15 +28,15 @@ export function audit(
   }
 }
 
-export function auditAs(
+export async function auditAs(
   userId: number | null,
   action: string,
   entity: string,
   entityId: string | number | null,
   metadata: Meta = {},
   ip?: string,
-): void {
-  run(
+): Promise<void> {
+  await run(
     'INSERT INTO audit_logs (user_id, action, entity, entity_id, metadata, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [userId, action, entity, entityId === null ? null : String(entityId), JSON.stringify(metadata), ip ?? null, new Date().toISOString()],
   );

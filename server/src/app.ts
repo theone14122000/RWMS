@@ -19,6 +19,7 @@ import { callsRouter } from './modules/calls/calls.routes.js';
 import { telephonyWebhooksRouter } from './modules/calls/webhooks.routes.js';
 import { quotationsRouter } from './modules/quotations/quotations.routes.js';
 import { bookingsRouter } from './modules/bookings/bookings.routes.js';
+import { invoicesRouter } from './modules/invoices/invoices.routes.js';
 import { reportsRouter } from './modules/reports/reports.routes.js';
 import { importsRouter } from './modules/imports/imports.routes.js';
 import { duplicatesRouter } from './modules/duplicates/duplicates.routes.js';
@@ -39,10 +40,30 @@ export function createApp(): Express {
   app.use(express.json({ limit: '1mb' }));
 
   // Security headers (minimal, dependency-free)
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'same-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "object-src 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'",
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
+        "font-src 'self' data:",
+        "style-src 'self' 'unsafe-inline'",
+        "script-src 'self'",
+        "connect-src 'self'",
+      ].join('; '),
+    );
+    if (config.isProduction && (req.secure || config.trustProxy)) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
     next();
   });
 
@@ -79,6 +100,7 @@ export function createApp(): Express {
   app.use('/api/calls', callsRouter);
   app.use('/api/quotations', quotationsRouter);
   app.use('/api/bookings', bookingsRouter);
+  app.use('/api/invoices', invoicesRouter);
   app.use('/api/reports', reportsRouter);
   app.use('/api/imports', importsRouter);
   app.use('/api/duplicates', duplicatesRouter);

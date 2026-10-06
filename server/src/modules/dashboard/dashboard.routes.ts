@@ -40,7 +40,7 @@ function dimensionFilters(req: any, alias = 'l'): { where: string[]; params: unk
 }
 
 /** GET /api/dashboard/admin — team-wide KPIs, charts and action lists. */
-dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'), (req, res, next) => {
+dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'), async (req, res, next) => {
   try {
     const today = todayStr();
     const dims = dimensionFilters(req);
@@ -62,7 +62,7 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
     }
     const whereSql = baseWhere.length ? `WHERE ${baseWhere.join(' AND ')}` : '';
 
-    const totals = get<any>(
+    const totals = (await get<any>(
       `SELECT
         COUNT(*) AS total_leads,
         SUM(CASE WHEN s.code = 'NEW' THEN 1 ELSE 0 END) AS new_leads,
@@ -75,7 +75,7 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
        JOIN lead_statuses s ON s.id = l.status_id
        ${whereSql}`,
       baseParams,
-    )!;
+    ))!;
 
     const followUpWhere = ['f.deleted_at IS NULL', 'l.deleted_at IS NULL'];
     const followUpParams: unknown[] = [];
@@ -93,7 +93,7 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
     }
     const fuWhereSql = `WHERE ${followUpWhere.join(' AND ')}`;
 
-    const fuCounts = get<any>(
+    const fuCounts = (await get<any>(
       `SELECT
         SUM(CASE WHEN f.scheduled_date = '${today}' AND f.status NOT IN ${TERMINAL_SQL} THEN 1 ELSE 0 END) AS todays_follow_ups,
         SUM(CASE WHEN f.scheduled_date < '${today}' AND f.status NOT IN ${TERMINAL_SQL} THEN 1 ELSE 0 END) AS overdue_follow_ups,
@@ -101,16 +101,16 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
        FROM follow_ups f JOIN leads l ON l.id = f.lead_id
        ${fuWhereSql}`,
       followUpParams,
-    )!;
+    ))!;
 
-    const activeWorkers = get<{ c: number }>(
+    const activeWorkers = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM users u JOIN roles r ON r.id = u.role_id
        WHERE r.code = 'WORKER' AND u.status = 'ACTIVE' AND u.deleted_at IS NULL`,
-    )!.c;
+    ))!.c;
 
     const callScope = req.query.worker_id ? 'AND cl.worker_id = ?' : '';
     const callParams = req.query.worker_id ? [Number(req.query.worker_id)] : [];
-    const callsToday = get<any>(
+    const callsToday = (await get<any>(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN cl.status IN ('ANSWERED','COMPLETED') THEN 1 ELSE 0 END) AS connected,
               SUM(CASE WHEN cl.status IN ('MISSED','NO_ANSWER') THEN 1 ELSE 0 END) AS missed,
@@ -118,9 +118,9 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
        FROM calls cl
        WHERE cl.deleted_at IS NULL AND substr(COALESCE(cl.started_at, cl.created_at), 1, 10) = '${today}' ${callScope}`,
       callParams,
-    )!;
+    ))!;
 
-    const pipeline = get<any>(
+    const pipeline = (await get<any>(
       `SELECT
          (SELECT COUNT(*) FROM quotations WHERE deleted_at IS NULL AND status NOT IN ('ACCEPTED','REJECTED','CANCELLED','EXPIRED')) AS open_quotations,
          (SELECT COALESCE(SUM(total_amount), 0) FROM quotations
@@ -128,9 +128,9 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
          (SELECT COUNT(*) FROM bookings WHERE deleted_at IS NULL AND status NOT IN ('CANCELLED','COMPLETED')) AS active_bookings,
          (SELECT COALESCE(SUM(total_amount - paid_amount), 0) FROM bookings WHERE deleted_at IS NULL AND status != 'CANCELLED') AS outstanding_amount,
          (SELECT COALESCE(SUM(paid_amount), 0) FROM bookings WHERE deleted_at IS NULL AND status != 'CANCELLED') AS collected_amount`,
-    )!;
+    ))!;
 
-    const recentCalls = all(
+    const recentCalls = await all(
       `SELECT cl.id, cl.lead_id, cl.direction, cl.status, cl.phone_number, cl.started_at, cl.duration_seconds,
               cl.recording_available, l.lead_number, c.name AS customer_name, u.name AS worker_name
        FROM calls cl
@@ -141,14 +141,14 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
        ORDER BY COALESCE(cl.started_at, cl.created_at) DESC LIMIT 6`,
     );
 
-    const leadsByStatus = all(
+    const leadsByStatus = await all(
       `SELECT s.code, s.name, s.color, s.category, COUNT(*) AS count
        FROM leads l JOIN lead_statuses s ON s.id = l.status_id
        ${whereSql} GROUP BY s.id ORDER BY s.sort_order`,
       baseParams,
     );
 
-    const leadsBySource = all(
+    const leadsBySource = await all(
       `SELECT COALESCE(src.name, 'Unknown') AS name, COUNT(*) AS count
        FROM leads l
        JOIN lead_statuses s ON s.id = l.status_id
@@ -165,7 +165,7 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
       `${trendFrom}T00:00:00.000Z`,
       `${addDays(trendTo, 1)}T00:00:00.000Z`,
     ];
-    const trendRows = all<{ d: string; c: number }>(
+    const trendRows = await all<{ d: string; c: number }>(
       `SELECT ${sqlLocalDate('l.created_at')} AS d, COUNT(*) AS c
        FROM leads l JOIN lead_statuses s ON s.id = l.status_id
        WHERE ${trendWhere.join(' AND ')} GROUP BY d`,
@@ -182,14 +182,14 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
       guard += 1;
     }
 
-    const fuOutcomes = all(
+    const fuOutcomes = await all(
       `SELECT ${effectiveFuStatus('f.status', 'f.scheduled_date').sql.replace(/\?/g, `'${today}'`)} AS status, COUNT(*) AS count
        FROM follow_ups f JOIN leads l ON l.id = f.lead_id
-       ${fuWhereSql} GROUP BY status ORDER BY count DESC`,
+       ${fuWhereSql} GROUP BY 1 ORDER BY count DESC`,
       followUpParams,
     );
 
-    const recentLeads = all(
+    const recentLeads = await all(
       `SELECT l.id, l.lead_number, l.destination, l.priority, l.created_at, l.budget, l.currency,
               c.name AS customer_name, s.code AS status_code, s.name AS status_name, s.color AS status_color,
               u.name AS assignee_name
@@ -211,10 +211,10 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
       JOIN users u ON u.id = f.worker_id
       WHERE f.deleted_at IS NULL AND l.deleted_at IS NULL AND f.status NOT IN ${TERMINAL_SQL}`;
 
-    const todaysFollowUps = all(`${listFuSelect} AND f.scheduled_date = '${today}' ORDER BY f.scheduled_time ASC LIMIT 8`);
-    const overdueFollowUps = all(`${listFuSelect} AND f.scheduled_date < '${today}' ORDER BY f.scheduled_date ASC LIMIT 8`);
+    const todaysFollowUps = await all(`${listFuSelect} AND f.scheduled_date = '${today}' ORDER BY f.scheduled_time ASC LIMIT 8`);
+    const overdueFollowUps = await all(`${listFuSelect} AND f.scheduled_date < '${today}' ORDER BY f.scheduled_date ASC LIMIT 8`);
 
-    const unassigned = all(
+    const unassigned = await all(
       `SELECT l.id, l.lead_number, l.destination, l.priority, l.created_at,
               c.name AS customer_name, s.code AS status_code, s.color AS status_color, src.name AS source_name
        FROM leads l
@@ -274,14 +274,14 @@ dashboardRouter.get('/admin', requireAuth, requirePermission('dashboard:admin'),
 });
 
 /** GET /api/dashboard/worker — the "what do I do next?" screen. */
-dashboardRouter.get('/worker', requireAuth, (req, res, next) => {
+dashboardRouter.get('/worker', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     if (!can(req, 'dashboard:worker') && !can(req, 'dashboard:admin')) throw forbidden();
     const workerId = can(req, 'dashboard:admin') && req.query.worker_id ? Number(req.query.worker_id) : user.id;
     const today = todayStr();
 
-    const stats = get<any>(
+    const stats = (await get<any>(
       `SELECT
         (SELECT COUNT(*) FROM leads l JOIN lead_statuses s ON s.id = l.status_id
            WHERE l.assigned_to = ? AND l.deleted_at IS NULL
@@ -306,9 +306,9 @@ dashboardRouter.get('/worker', requireAuth, (req, res, next) => {
         (SELECT COUNT(*) FROM follow_ups
            WHERE worker_id = ? AND deleted_at IS NULL AND status IN ('COMPLETED','CONVERTED')) AS completed_follow_ups`,
       [workerId, workerId, workerId, workerId, workerId, workerId, workerId, workerId, workerId],
-    )!;
+    ))!;
 
-    const todayLeads = all(
+    const todayLeads = await all(
       `SELECT l.id, l.lead_number, l.destination, l.priority, l.budget, l.currency, l.travel_start_date,
               l.next_follow_up_at, l.created_at, c.name AS customer_name, c.phone AS customer_phone,
               s.code AS status_code, s.name AS status_name, s.color AS status_color,
@@ -338,15 +338,15 @@ dashboardRouter.get('/worker', requireAuth, (req, res, next) => {
       JOIN users u ON u.id = f.worker_id
       WHERE f.deleted_at IS NULL AND l.deleted_at IS NULL AND f.worker_id = ? AND f.status NOT IN ${TERMINAL_SQL}`;
 
-    const todaysFollowUps = all(`${followUpSelect} AND f.scheduled_date = '${today}' ORDER BY f.scheduled_time ASC LIMIT 10`, [
+    const todaysFollowUps = await all(`${followUpSelect} AND f.scheduled_date = '${today}' ORDER BY f.scheduled_time ASC LIMIT 10`, [
       workerId,
     ]);
-    const overdueFollowUps = all(
+    const overdueFollowUps = await all(
       `${followUpSelect} AND f.scheduled_date < '${today}' ORDER BY f.scheduled_date ASC LIMIT 10`,
       [workerId],
     );
 
-    const activity = all(
+    const activity = await all(
       `SELECT t.id, t.type, t.summary, t.created_at, t.lead_id, l.lead_number, c.name AS customer_name
        FROM lead_timeline t
        JOIN leads l ON l.id = t.lead_id
@@ -356,16 +356,16 @@ dashboardRouter.get('/worker', requireAuth, (req, res, next) => {
       [workerId],
     );
 
-    const myCalls = get<any>(
+    const myCalls = (await get<any>(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN status IN ('ANSWERED','COMPLETED') THEN 1 ELSE 0 END) AS connected,
               SUM(CASE WHEN status IN ('MISSED','NO_ANSWER') THEN 1 ELSE 0 END) AS missed
        FROM calls
        WHERE worker_id = ? AND deleted_at IS NULL AND substr(COALESCE(started_at, created_at), 1, 10) = '${today}'`,
       [workerId],
-    )!;
+    ))!;
 
-    const todayCalls = all(
+    const todayCalls = await all(
       `SELECT cl.id, cl.lead_id, cl.direction, cl.status, cl.phone_number, cl.started_at, cl.duration_seconds,
               l.lead_number, c.name AS customer_name
        FROM calls cl

@@ -3,7 +3,19 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-export const SERVER_ROOT = path.resolve(here, '..');
+// Resolve the server package root by walking up to the nearest package.json.
+// Works from src (tsx dev/test) and from dist/src (compiled), where a naive
+// `..` would point at server/dist and break .env loading, data/ and client/dist.
+function findServerRoot(start: string): string {
+  let dir = start;
+  for (;;) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return path.resolve(start, '..');
+    dir = parent;
+  }
+}
+export const SERVER_ROOT = findServerRoot(here);
 export const PROJECT_ROOT = path.resolve(SERVER_ROOT, '..');
 
 try {
@@ -33,17 +45,32 @@ function bool(key: string, fallback: boolean): boolean {
 }
 
 const nodeEnv = str('NODE_ENV', 'development');
+const isProduction = nodeEnv === 'production';
+
+// Fail fast on a well-known default admin password in production: any deploy
+// without an explicit ADMIN_PASSWORD would otherwise seed a known-credential admin.
+const adminPassword = process.env.ADMIN_PASSWORD?.trim();
+if (isProduction && !adminPassword) {
+  throw new Error(
+    '[crm] ADMIN_PASSWORD is required in production. Set it in the environment before starting the server.',
+  );
+}
 
 export const config = {
   nodeEnv,
-  isProduction: nodeEnv === 'production',
+  isProduction,
   isTest: nodeEnv === 'test',
   port: num('PORT', 4000),
   host: str('HOST', '0.0.0.0'),
   databasePath: str('DATABASE_PATH', path.join(SERVER_ROOT, 'data', 'crm.sqlite')),
+  // PostgreSQL connection string (e.g. Railway). When set the app uses PG;
+  // when empty it falls back to the local SQLite file (dev/tests).
+  databaseUrl: str('DATABASE_URL', ''),
+  pgPoolMax: num('PG_POOL_MAX', 10),
   sessionCookieName: str('SESSION_COOKIE', 'ta_crm_session'),
   sessionTtlDays: num('SESSION_TTL_DAYS', 7),
-  cookieSecure: bool('COOKIE_SECURE', false),
+  sessionAbsoluteTtlDays: num('SESSION_ABSOLUTE_TTL_DAYS', 30),
+  cookieSecure: bool('COOKIE_SECURE', isProduction),
   trustProxy: bool('TRUST_PROXY', false),
   businessTimezone: str('BUSINESS_TIMEZONE', 'Asia/Kolkata'),
   clientDist: path.join(PROJECT_ROOT, 'client', 'dist'),
@@ -53,10 +80,15 @@ export const config = {
     max: num('RATE_LIMIT_MAX', 600),
     loginMax: num('LOGIN_RATE_LIMIT_MAX', 15),
   },
+  loginLockout: {
+    maxAttempts: num('LOGIN_LOCKOUT_MAX_ATTEMPTS', 5),
+    minutes: num('LOGIN_LOCKOUT_MINUTES', 15),
+  },
+  passwordResetTtlMinutes: num('PASSWORD_RESET_TTL_MINUTES', 30),
   seedDemoData: bool('SEED_DEMO_DATA', nodeEnv === 'development'),
   admin: {
     name: str('ADMIN_NAME', 'System Owner'),
     email: str('ADMIN_EMAIL', 'admin@travelcrm.local'),
-    password: str('ADMIN_PASSWORD', 'Admin@1234!'),
+    password: adminPassword || str('ADMIN_PASSWORD', 'Admin@1234!'),
   },
 };

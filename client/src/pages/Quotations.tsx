@@ -291,7 +291,7 @@ function QuotationDetail({ quotation, onChanged }: { quotation: any; onChanged: 
         ) : null}
       </div>
 
-      <div className="kpi-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+      <div className="kpi-grid kpi-2">
         <div className="kpi accent-green">
           <div className="label">Total</div>
           <div className="value" style={{ fontSize: 19 }}>{formatCurrency(quotation.total_amount, quotation.currency)}</div>

@@ -41,15 +41,15 @@ const updateSchema = createSchema
 
 const statusSchema = z.object({ status: z.enum(WORKER_STATUSES) });
 
-function assertUnique(user: { email: string; username?: string | null }, excludeId?: number): void {
-  const emailRow = get<{ id: number }>(
+async function assertUnique(user: { email: string; username?: string | null }, excludeId?: number): Promise<void> {
+  const emailRow = await get<{ id: number }>(
     'SELECT id FROM users WHERE lower(email) = lower(?) AND deleted_at IS NULL',
     [user.email],
   );
   if (emailRow && emailRow.id !== excludeId) throw conflict('A worker with this email already exists.');
 
   if (user.username) {
-    const usernameRow = get<{ id: number }>(
+    const usernameRow = await get<{ id: number }>(
       'SELECT id FROM users WHERE lower(username) = lower(?) AND deleted_at IS NULL',
       [user.username],
     );
@@ -75,7 +75,7 @@ function shape(row: Record<string, any>) {
 }
 
 /** GET /api/users — worker directory (admin only). */
-usersRouter.get('/', requireAuth, requirePermission('users:manage'), (req, res, next) => {
+usersRouter.get('/', requireAuth, requirePermission('users:manage'), async (req, res, next) => {
   try {
     const { page, limit, offset } = pagination(req.query);
     const search = String(req.query.search ?? '').trim();
@@ -87,7 +87,7 @@ usersRouter.get('/', requireAuth, requirePermission('users:manage'), (req, res, 
 
     if (search) {
       where.push('(u.name LIKE ? ESCAPE \'\\\' OR u.email LIKE ? ESCAPE \'\\\' OR u.phone LIKE ? ESCAPE \'\\\' OR u.username LIKE ? ESCAPE \'\\\')');
-      const term = likeTerm(search);
+      const term = await likeTerm(search);
       params.push(term, term, term, term);
     }
     if (status.length) {
@@ -100,12 +100,12 @@ usersRouter.get('/', requireAuth, requirePermission('users:manage'), (req, res, 
     }
 
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(
+    const total = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM users u JOIN roles r ON r.id = u.role_id ${whereSql}`,
       params,
-    )!.c;
+    ))!.c;
 
-    const rows = all(
+    const rows = await all(
       `SELECT u.id, u.name, u.email, u.phone, u.username, u.status, u.last_login_at, u.created_at, u.updated_at,
               r.code AS role_code,
               (SELECT COUNT(*) FROM leads l WHERE l.assigned_to = u.id AND l.deleted_at IS NULL) AS lead_count,
@@ -125,17 +125,17 @@ usersRouter.get('/', requireAuth, requirePermission('users:manage'), (req, res, 
 });
 
 /** POST /api/users — create a worker (or another admin). */
-usersRouter.post('/', requireAuth, requirePermission('users:manage'), (req, res, next) => {
+usersRouter.post('/', requireAuth, requirePermission('users:manage'), async (req, res, next) => {
   try {
     const body = meta(createSchema, req.body);
-    assertUnique(body);
+    await assertUnique(body);
 
-    const role = get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [body.role]);
+    const role = await get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [body.role]);
     if (!role) throw badRequest('Unknown role.');
 
-    const now = nowISO();
-    const result = tx(() => {
-      const inserted = run(
+    const now = await nowISO();
+    const result = await tx(async () => {
+      const inserted = await run(
         `INSERT INTO users (name, email, phone, username, password_hash, role_id, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
@@ -153,14 +153,14 @@ usersRouter.post('/', requireAuth, requirePermission('users:manage'), (req, res,
       return inserted.lastInsertRowid;
     });
 
-    audit(req, 'WORKER_CREATED', 'user', result, {
+    await audit(req, 'WORKER_CREATED', 'user', result, {
       name: body.name,
       email: body.email,
       role: body.role,
       status: body.status,
     });
 
-    const row = get(`SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`, [
+    const row = await get(`SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`, [
       result,
     ]);
     created(res, shape(row!));
@@ -170,20 +170,20 @@ usersRouter.post('/', requireAuth, requirePermission('users:manage'), (req, res,
 });
 
 /** GET /api/users/:id — worker profile (admin or self). */
-usersRouter.get('/:id', requireAuth, (req, res, next) => {
+usersRouter.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     const id = Number(req.params.id);
     if (user.role !== 'ADMIN' && user.id !== id) throw forbidden();
 
-    const row = get<any>(
+    const row = await get<any>(
       `SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ? AND u.deleted_at IS NULL`,
       [id],
     );
     if (!row) throw notFound('Worker not found.');
 
     const today = todayStr();
-    const workload = get<{ total: number; open: number; today_fu: number; overdue_fu: number }>(
+    const workload = await get<{ total: number; open: number; today_fu: number; overdue_fu: number }>(
       `SELECT
         (SELECT COUNT(*) FROM leads WHERE assigned_to = ? AND deleted_at IS NULL) AS total,
         (SELECT COUNT(*) FROM leads l JOIN lead_statuses s ON s.id = l.status_id
@@ -202,14 +202,14 @@ usersRouter.get('/:id', requireAuth, (req, res, next) => {
 });
 
 /** PATCH /api/users/:id — edit a worker. */
-usersRouter.patch('/:id', requireAuth, requirePermission('users:manage'), (req, res, next) => {
+usersRouter.patch('/:id', requireAuth, requirePermission('users:manage'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const existing = get<any>('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL', [id]);
+    const existing = await get<any>('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!existing) throw notFound('Worker not found.');
 
     const body = meta(updateSchema, req.body);
-    assertUnique(
+    await assertUnique(
       {
         email: body.email ?? existing.email,
         username: body.username !== undefined ? body.username : existing.username,
@@ -217,16 +217,16 @@ usersRouter.patch('/:id', requireAuth, requirePermission('users:manage'), (req, 
       id,
     );
 
-    const now = nowISO();
+    const now = await nowISO();
     let roleId = existing.role_id;
     if (body.role) {
-      const role = get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [body.role]);
+      const role = await get<{ id: number }>('SELECT id FROM roles WHERE code = ?', [body.role]);
       if (!role) throw badRequest('Unknown role.');
       roleId = role.id;
     }
 
     const nextStatus = body.status ?? existing.status;
-    run(
+    await run(
       `UPDATE users SET name = ?, email = ?, phone = ?, username = ?, role_id = ?, status = ?,
         password_hash = COALESCE(?, password_hash), updated_at = ? WHERE id = ?`,
       [
@@ -243,16 +243,16 @@ usersRouter.patch('/:id', requireAuth, requirePermission('users:manage'), (req, 
     );
 
     if (nextStatus !== 'ACTIVE' || body.password || roleId !== existing.role_id) {
-      revokeAllSessions(id);
+      await revokeAllSessions(id);
     }
 
-    audit(req, 'WORKER_UPDATED', 'user', id, {
+    await audit(req, 'WORKER_UPDATED', 'user', id, {
       changed: Object.keys(body),
       status: nextStatus,
       role: body.role ?? existing.role_code,
     });
 
-    const row = get(`SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`, [id]);
+    const row = await get(`SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`, [id]);
     ok(res, shape(row!));
   } catch (err) {
     next(err);
@@ -260,21 +260,21 @@ usersRouter.patch('/:id', requireAuth, requirePermission('users:manage'), (req, 
 });
 
 /** PATCH /api/users/:id/status — activate / deactivate / suspend. */
-usersRouter.patch('/:id/status', requireAuth, requirePermission('users:manage'), (req, res, next) => {
+usersRouter.patch('/:id/status', requireAuth, requirePermission('users:manage'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const body = meta(statusSchema, req.body);
-    const existing = get<any>('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL', [id]);
+    const existing = await get<any>('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!existing) throw notFound('Worker not found.');
     if (existing.id === currentUser(req).id && body.status !== 'ACTIVE') {
       throw badRequest('You cannot disable your own account.');
     }
 
-    run('UPDATE users SET status = ?, updated_at = ? WHERE id = ?', [body.status, nowISO(), id]);
-    if (body.status !== 'ACTIVE') revokeAllSessions(id);
+    await run('UPDATE users SET status = ?, updated_at = ? WHERE id = ?', [body.status, await nowISO(), id]);
+    if (body.status !== 'ACTIVE') await revokeAllSessions(id);
 
-    audit(req, 'WORKER_STATUS_CHANGED', 'user', id, { from: existing.status, to: body.status });
-    const row = get(`SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`, [id]);
+    await audit(req, 'WORKER_STATUS_CHANGED', 'user', id, { from: existing.status, to: body.status });
+    const row = await get(`SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`, [id]);
     ok(res, shape(row!));
   } catch (err) {
     next(err);
@@ -282,14 +282,14 @@ usersRouter.patch('/:id/status', requireAuth, requirePermission('users:manage'),
 });
 
 /** GET /api/users/:id/activity — a worker's own recent activity. */
-usersRouter.get('/:id/activity', requireAuth, (req, res, next) => {
+usersRouter.get('/:id/activity', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     const id = Number(req.params.id);
     if (user.role !== 'ADMIN' && user.id !== id) throw forbidden();
 
     const limit = Math.min(100, Number(req.query.limit) || 30);
-    const rows = all(
+    const rows = await all(
       `SELECT t.id, t.type, t.summary, t.metadata, t.created_at, t.lead_id, l.lead_number,
               c.name AS customer_name, l.destination
        FROM lead_timeline t

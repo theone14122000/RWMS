@@ -4,22 +4,25 @@ import { all, get } from '../../db/database.js';
 import { badRequest, notFound } from '../../lib/errors.js';
 import { meta, ok } from '../../lib/http.js';
 import { currentUser, requireAuth, requirePermission } from '../../middleware/auth.js';
+import { loadLead } from '../leads/leads.service.js';
 import { audit } from '../../services/audit.js';
 import { addTimelineEvent, TIMELINE_TYPES } from '../../services/timeline.js';
 import { aiStatus, getAiProvider } from '../../services/ai.js';
 
 export const aiRouter = Router();
 
-aiRouter.get('/status', requireAuth, requirePermission('ai:use'), (_req, res, next) => {
+aiRouter.get('/status', requireAuth, requirePermission('ai:use'), async (_req, res, next) => {
   try {
-    ok(res, aiStatus());
+    ok(res, await aiStatus());
   } catch (err) {
     next(err);
   }
 });
 
-function leadContext(leadId: number): { promptData: string; lead: any } {
-  const lead = get<any>(
+async function leadContext(req: any, leadId: number): Promise<{ promptData: string; lead: any }> {
+  // Ownership/permission check first — mirrors every other lead reader.
+  await loadLead(leadId, req);
+  const lead = await get<any>(
     `SELECT l.*, ls.code AS status_code, ls.name AS status_name, c.name AS customer_name, c.phone AS customer_phone,
             c.email AS customer_email, src.name AS source_name, w.name AS worker_name
      FROM leads l
@@ -32,25 +35,25 @@ function leadContext(leadId: number): { promptData: string; lead: any } {
   );
   if (!lead) throw notFound('Lead not found.');
 
-  const followUps = all<any>(
+  const followUps = await all<any>(
     `SELECT f.scheduled_date, f.scheduled_time, f.type, f.status, f.notes, f.next_action, f.customer_response, w.name AS worker
      FROM follow_ups f JOIN users w ON w.id = f.worker_id
      WHERE f.lead_id = ? ORDER BY f.scheduled_date DESC, f.id DESC LIMIT 10`,
     [leadId],
   );
-  const calls = all<any>(
+  const calls = await all<any>(
     `SELECT cl.direction, cl.status, cl.duration_seconds, cl.started_at, cl.disposition, cl.notes, w.name AS worker
      FROM calls cl LEFT JOIN users w ON w.id = cl.worker_id
      WHERE cl.lead_id = ? AND cl.deleted_at IS NULL
      ORDER BY COALESCE(cl.started_at, cl.created_at) DESC LIMIT 10`,
     [leadId],
   );
-  const notes = all<any>(
+  const notes = await all<any>(
     `SELECT n.content, n.created_at, u.name AS author FROM notes n LEFT JOIN users u ON u.id = n.author_id
      WHERE n.lead_id = ? AND n.deleted_at IS NULL ORDER BY n.id DESC LIMIT 10`,
     [leadId],
   );
-  const quotations = all<any>(
+  const quotations = await all<any>(
     `SELECT quotation_number, status, total_amount, currency, valid_until FROM quotations
      WHERE lead_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 5`,
     [leadId],
@@ -98,14 +101,14 @@ function leadContext(leadId: number): { promptData: string; lead: any } {
 aiRouter.post('/summary', requireAuth, requirePermission('ai:use'), async (req, res, next) => {
   try {
     const body = meta(z.object({ lead_id: z.number().int().positive() }), req.body);
-    const status = aiStatus();
+    const status = await aiStatus();
     if (!status.configured) {
       ok(res, { configured: false, reason: status.reason ?? 'Integration Not Configured', draft: null });
       return;
     }
 
-    const { promptData, lead } = leadContext(body.lead_id);
-    const provider = getAiProvider();
+    const { promptData, lead } = await leadContext(req, body.lead_id);
+    const provider = await getAiProvider();
     const draft = await provider.complete(
       [
         'You are a concise travel-agency CRM assistant.',
@@ -118,8 +121,8 @@ aiRouter.post('/summary', requireAuth, requirePermission('ai:use'), async (req, 
     );
 
     const user = currentUser(req);
-    audit(req, 'AI_SUMMARY_DRAFTED', 'lead', body.lead_id, { provider: provider.code, model: provider.model });
-    addTimelineEvent({
+    await audit(req, 'AI_SUMMARY_DRAFTED', 'lead', body.lead_id, { provider: provider.code, model: provider.model });
+    await addTimelineEvent({
       leadId: body.lead_id,
       type: TIMELINE_TYPES.AI_SUMMARY_GENERATED,
       actorId: user.id,
@@ -144,14 +147,14 @@ aiRouter.post('/message-draft', requireAuth, requirePermission('ai:use'), async 
       }),
       req.body,
     );
-    const status = aiStatus();
+    const status = await aiStatus();
     if (!status.configured) {
       ok(res, { configured: false, reason: status.reason ?? 'Integration Not Configured', draft: null });
       return;
     }
 
-    const { promptData } = leadContext(body.lead_id);
-    const provider = getAiProvider();
+    const { promptData } = await leadContext(req, body.lead_id);
+    const provider = await getAiProvider();
     const draft = await provider.complete(
       [
         `Draft a friendly ${body.channel} message from a travel agency to this customer.`,
@@ -163,7 +166,7 @@ aiRouter.post('/message-draft', requireAuth, requirePermission('ai:use'), async 
     );
 
     const user = currentUser(req);
-    audit(req, 'AI_MESSAGE_DRAFTED', 'lead', body.lead_id, {
+    await audit(req, 'AI_MESSAGE_DRAFTED', 'lead', body.lead_id, {
       provider: provider.code,
       channel: body.channel,
     });

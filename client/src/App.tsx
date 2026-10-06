@@ -3,6 +3,9 @@ import { useAuth } from './auth/AuthContext';
 import Layout from './layout/Layout';
 import { LoadingState } from './ui/atoms';
 import Login from './pages/Login';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
+import Profile from './pages/Profile';
 import Dashboard from './pages/Dashboard';
 import Leads from './pages/Leads';
 import LeadDetail from './pages/LeadDetail';
@@ -14,6 +17,7 @@ import Settings from './pages/Settings';
 import Calls from './pages/Calls';
 import Quotations from './pages/Quotations';
 import Bookings from './pages/Bookings';
+import Invoices from './pages/Invoices';
 import Reports from './pages/Reports';
 import Analytics from './pages/Analytics';
 import Automation from './pages/Automation';
@@ -41,6 +45,8 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
+      <Route path="/reset-password" element={<ResetPassword />} />
       <Route
         element={
           <Protected>
@@ -56,6 +62,7 @@ export default function App() {
         <Route path="/calls" element={<Calls />} />
         <Route path="/quotations" element={<Quotations />} />
         <Route path="/bookings" element={<Bookings />} />
+        <Route path="/invoices" element={<Invoices />} />
         <Route path="/reports" element={<Reports />} />
         <Route
           path="/analytics"
@@ -106,6 +113,7 @@ export default function App() {
           }
         />
         <Route path="/activity" element={<Activity />} />
+        <Route path="/profile" element={<Profile />} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>

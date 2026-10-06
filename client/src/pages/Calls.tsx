@@ -13,7 +13,7 @@ import {
   Pagination,
   TableSkeleton,
 } from '../ui/atoms';
-import { Drawer, Modal } from '../ui/overlays';
+import { Drawer, Modal, useConfirm } from '../ui/overlays';
 import { LeadPicker } from '../ui/pickers';
 import { useToast } from '../ui/Toast';
 
@@ -310,9 +310,17 @@ function CallDetail({
   onLeadChanged: () => void;
 }) {
   const toast = useToast();
+  const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
 
   const deleteRec = async () => {
+    const okConfirm = await confirm({
+      title: 'Delete recording?',
+      message: 'The recording file is removed permanently. This cannot be undone.',
+      confirmLabel: 'Delete recording',
+      danger: true,
+    });
+    if (!okConfirm) return;
     setBusy(true);
     try {
       const res = await del(`/api/calls/${call.id}/recording`);

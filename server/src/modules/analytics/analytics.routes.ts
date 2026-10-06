@@ -30,18 +30,18 @@ function periodWindow(query: unknown): { from: string; to: string; granularity: 
 
 /* ------------------------------- OVERVIEW ------------------------------ */
 
-analyticsRouter.get('/overview', requireAuth, requirePermission('analytics:read'), (req, res, next) => {
+analyticsRouter.get('/overview', requireAuth, requirePermission('analytics:read'), async (req, res, next) => {
   try {
     const { from, to, granularity } = periodWindow(req.query);
 
-    const leadsCreated = all<{ bucket: string; c: number }>(
+    const leadsCreated = await all<{ bucket: string; c: number }>(
       `SELECT substr(created_at, 1, ${granularity === 'month' ? 7 : 10}) AS bucket, COUNT(*) AS c
        FROM leads WHERE deleted_at IS NULL AND substr(created_at, 1, 10) BETWEEN ? AND ?
        GROUP BY bucket ORDER BY bucket`,
       [from, to],
     );
 
-    const leadsWon = all<{ bucket: string; c: number }>(
+    const leadsWon = await all<{ bucket: string; c: number }>(
       `SELECT substr(h.changed_at, 1, ${granularity === 'month' ? 7 : 10}) AS bucket, COUNT(*) AS c
        FROM lead_status_history h
        JOIN lead_statuses ts ON ts.id = h.to_status_id
@@ -50,7 +50,7 @@ analyticsRouter.get('/overview', requireAuth, requirePermission('analytics:read'
       [from, to],
     );
 
-    const followUps = all<{ bucket: string; due: number; completed: number }>(
+    const followUps = await all<{ bucket: string; due: number; completed: number }>(
       `SELECT substr(scheduled_date, 1, ${granularity === 'month' ? 7 : 10}) AS bucket,
               COUNT(*) AS due,
               SUM(CASE WHEN status IN ('COMPLETED','CONVERTED') THEN 1 ELSE 0 END) AS completed
@@ -59,7 +59,7 @@ analyticsRouter.get('/overview', requireAuth, requirePermission('analytics:read'
       [from, to],
     );
 
-    const calls = all<{ bucket: string; total: number; connected: number; seconds: number }>(
+    const calls = await all<{ bucket: string; total: number; connected: number; seconds: number }>(
       `SELECT substr(COALESCE(started_at, created_at), 1, ${granularity === 'month' ? 7 : 10}) AS bucket,
               COUNT(*) AS total,
               SUM(CASE WHEN status IN ('ANSWERED','COMPLETED') THEN 1 ELSE 0 END) AS connected,
@@ -69,7 +69,7 @@ analyticsRouter.get('/overview', requireAuth, requirePermission('analytics:read'
       [from, to],
     );
 
-    const revenue = all<{ bucket: string; amount: number; paid: number; count: number }>(
+    const revenue = await all<{ bucket: string; amount: number; paid: number; count: number }>(
       `SELECT substr(created_at, 1, 7) AS bucket,
               COALESCE(SUM(total_amount), 0) AS amount,
               COALESCE(SUM(paid_amount), 0) AS paid,
@@ -129,7 +129,7 @@ interface WorkerMetrics {
   booking_paid: number;
 }
 
-function metricsFor(workerId: number | null, from: string, to: string): WorkerMetrics | null {
+async function metricsFor(workerId: number | null, from: string, to: string): Promise<WorkerMetrics | null> {
   const leadScope = workerId ? 'AND l.assigned_to = ?' : '';
   const fuScope = workerId ? 'AND f.worker_id = ?' : '';
   const callScope = workerId ? 'AND cl.worker_id = ?' : '';
@@ -137,15 +137,15 @@ function metricsFor(workerId: number | null, from: string, to: string): WorkerMe
   const bookingScope = workerId ? 'AND b.worker_id = ?' : '';
   const p1 = workerId ? [workerId] : [];
 
-  const leads = get<{ total: number; converted: number }>(
+  const leads = (await get<{ total: number; converted: number }>(
     `SELECT COUNT(*) AS total,
             SUM(CASE WHEN ls.code = 'CONVERTED' THEN 1 ELSE 0 END) AS converted
      FROM leads l JOIN lead_statuses ls ON ls.id = l.status_id
      WHERE l.deleted_at IS NULL AND substr(l.created_at, 1, 10) BETWEEN ? AND ? ${leadScope}`,
     [from, to, ...p1],
-  )!;
+  ))!;
 
-  const fu = get<{ due: number; completed: number; overdue: number }>(
+  const fu = (await get<{ due: number; completed: number; overdue: number }>(
     `SELECT COUNT(*) AS due,
             SUM(CASE WHEN f.status IN ('COMPLETED','CONVERTED') THEN 1 ELSE 0 END) AS completed,
             SUM(CASE WHEN f.status NOT IN ('COMPLETED','CONVERTED','NOT_INTERESTED') AND f.scheduled_date < ?
@@ -153,36 +153,36 @@ function metricsFor(workerId: number | null, from: string, to: string): WorkerMe
      FROM follow_ups f
      WHERE f.scheduled_date BETWEEN ? AND ? ${fuScope}`,
     [todayStr(), from, to, ...p1],
-  )!;
+  ))!;
 
-  const calls = get<{ total: number; connected: number; seconds: number }>(
+  const calls = (await get<{ total: number; connected: number; seconds: number }>(
     `SELECT COUNT(*) AS total,
             SUM(CASE WHEN cl.status IN ('ANSWERED','COMPLETED') THEN 1 ELSE 0 END) AS connected,
             COALESCE(SUM(cl.duration_seconds), 0) AS seconds
      FROM calls cl
      WHERE cl.deleted_at IS NULL AND substr(COALESCE(cl.started_at, cl.created_at), 1, 10) BETWEEN ? AND ? ${callScope}`,
     [from, to, ...p1],
-  )!;
+  ))!;
 
-  const quotes = get<{ total: number; accepted: number }>(
+  const quotes = (await get<{ total: number; accepted: number }>(
     `SELECT COUNT(*) AS total, SUM(CASE WHEN q.status = 'ACCEPTED' THEN 1 ELSE 0 END) AS accepted
      FROM quotations q
      WHERE q.deleted_at IS NULL AND substr(q.created_at, 1, 10) BETWEEN ? AND ? ${quoteScope}`,
     [from, to, ...p1],
-  )!;
+  ))!;
 
-  const bookings = get<{ total: number; amount: number; paid: number }>(
+  const bookings = (await get<{ total: number; amount: number; paid: number }>(
     `SELECT COUNT(*) AS total, COALESCE(SUM(b.total_amount), 0) AS amount, COALESCE(SUM(b.paid_amount), 0) AS paid
      FROM bookings b
      WHERE b.deleted_at IS NULL AND b.status != 'CANCELLED'
        AND substr(b.created_at, 1, 10) BETWEEN ? AND ? ${bookingScope}`,
     [from, to, ...p1],
-  )!;
+  ))!;
 
   let name = '';
   let status = 'ACTIVE';
   if (workerId) {
-    const user = get<{ name: string; status: string }>('SELECT name, status FROM users WHERE id = ?', [workerId]);
+    const user = await get<{ name: string; status: string }>('SELECT name, status FROM users WHERE id = ?', [workerId]);
     if (!user) return null;
     name = user.name;
     status = user.status;
@@ -208,20 +208,22 @@ function metricsFor(workerId: number | null, from: string, to: string): WorkerMe
   };
 }
 
-analyticsRouter.get('/workers', requireAuth, requirePermission('analytics:read'), (req, res, next) => {
+analyticsRouter.get('/workers', requireAuth, requirePermission('analytics:read'), async (req, res, next) => {
   try {
     const { from, to } = periodWindow(req.query);
-    const workers = all<{ id: number; name: string; status: string }>(
+    const workers = await all<{ id: number; name: string; status: string }>(
       `SELECT id, name, status FROM users
        WHERE deleted_at IS NULL AND id != 1
        ORDER BY CASE status WHEN 'ACTIVE' THEN 0 ELSE 1 END, name COLLATE NOCASE`,
     );
-    const rows = workers
-      .map((w) => {
-        const m = metricsFor(w.id, from, to);
-        return m ? { ...m, name: w.name, status: w.status } : null;
-      })
-      .filter(Boolean);
+    const rows = (
+      await Promise.all(
+        workers.map(async (w) => {
+          const m = await metricsFor(w.id, from, to);
+          return m ? { ...m, name: w.name, status: w.status } : null;
+        }),
+      )
+    ).filter(Boolean);
     ok(res, { period: { from, to }, workers: rows });
   } catch (err) {
     next(err);
@@ -230,19 +232,19 @@ analyticsRouter.get('/workers', requireAuth, requirePermission('analytics:read')
 
 /* ----------------------------- DRILL-DOWN ------------------------------ */
 
-analyticsRouter.get('/workers/:id(\\d+)', requireAuth, requirePermission('analytics:read'), (req, res, next) => {
+analyticsRouter.get('/workers/:id(\\d+)', requireAuth, requirePermission('analytics:read'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const { from, to } = periodWindow(req.query);
-    const worker = get<{ id: number; name: string; email: string | null; status: string; role_id: number }>(
+    const worker = await get<{ id: number; name: string; email: string | null; status: string; role_id: number }>(
       'SELECT id, name, email, status, role_id FROM users WHERE id = ? AND deleted_at IS NULL',
       [id],
     );
     if (!worker) throw notFound('Worker not found.');
 
-    const metrics = metricsFor(id, from, to)!;
+    const metrics = (await metricsFor(id, from, to))!;
 
-    const byLeadStatus = all<{ code: string; name: string; c: number }>(
+    const byLeadStatus = await all<{ code: string; name: string; c: number }>(
       `SELECT ls.code, ls.name, COUNT(l.id) AS c
        FROM lead_statuses ls
        LEFT JOIN leads l ON l.status_id = ls.id AND l.deleted_at IS NULL AND l.assigned_to = ?
@@ -251,7 +253,7 @@ analyticsRouter.get('/workers/:id(\\d+)', requireAuth, requirePermission('analyt
       [id],
     );
 
-    const upcoming = all(
+    const upcoming = await all(
       `SELECT f.id, f.scheduled_date, f.scheduled_time, f.type, f.status, l.lead_number, l.destination, c.name AS customer_name
        FROM follow_ups f
        JOIN leads l ON l.id = f.lead_id
@@ -262,7 +264,7 @@ analyticsRouter.get('/workers/:id(\\d+)', requireAuth, requirePermission('analyt
       [id],
     );
 
-    const recentActivity = all(
+    const recentActivity = await all(
       `SELECT t.id, t.type, t.summary, t.created_at, l.lead_number
        FROM lead_timeline t
        JOIN leads l ON l.id = t.lead_id
@@ -271,7 +273,7 @@ analyticsRouter.get('/workers/:id(\\d+)', requireAuth, requirePermission('analyt
       [id],
     );
 
-    const leadsByDestination = all<{ destination: string | null; c: number }>(
+    const leadsByDestination = await all<{ destination: string | null; c: number }>(
       `SELECT destination, COUNT(*) AS c FROM leads
        WHERE assigned_to = ? AND deleted_at IS NULL AND substr(created_at, 1, 10) BETWEEN ? AND ?
        GROUP BY destination ORDER BY c DESC LIMIT 10`,

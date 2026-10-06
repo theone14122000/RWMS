@@ -138,22 +138,22 @@ export class GenericRestTelephonyProvider implements TelephonyProvider {
   }
 }
 
-export function getTelephonyProvider(): TelephonyProvider {
-  const cfg = telephonyConfig();
+export async function getTelephonyProvider(): Promise<TelephonyProvider> {
+  const cfg = await telephonyConfig();
   if (cfg.provider === 'generic_rest' && cfg.base_url) return new GenericRestTelephonyProvider(cfg);
   return new NullTelephonyProvider();
 }
 
-export function telephonyStatus(): {
+export async function telephonyStatus(): Promise<{
   provider: string;
   label: string;
   configured: boolean;
   base_url: string;
   auth_env: string;
   secret_present: boolean;
-} {
-  const cfg = telephonyConfig();
-  const provider = getTelephonyProvider();
+}> {
+  const cfg = await telephonyConfig();
+  const provider = await getTelephonyProvider();
   return {
     provider: cfg.provider,
     label: provider.label,
@@ -178,10 +178,10 @@ export const WEBHOOK_SECRET_ENV = 'TELEPHONY_WEBHOOK_SECRET';
 /* Round-robin pointer is stored as a setting so state survives restarts */
 /* without an extra table.                                              */
 /* ------------------------------------------------------------------ */
-export function nextRoundRobin(candidates: number[]): number | null {
+export async function nextRoundRobin(candidates: number[]): Promise<number | null> {
   if (!candidates.length) return null;
-  const state = readSetting<{ index: number }>('assignment_state', { index: 0 });
+  const state = await readSetting<{ index: number }>('assignment_state', { index: 0 });
   const idx = (Number(state.index) || 0) % candidates.length;
-  writeSetting('assignment_state', { index: idx + 1, last_assigned_to: candidates[idx] });
+  await writeSetting('assignment_state', { index: idx + 1, last_assigned_to: candidates[idx] });
   return candidates[idx];
 }

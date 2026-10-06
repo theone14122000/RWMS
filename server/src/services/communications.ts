@@ -33,11 +33,11 @@ function providerSecret(cfg: ChannelConfig): string | undefined {
   return cfg.auth_env ? process.env[cfg.auth_env] : undefined;
 }
 
-export function sendCommunication(input: SendInput): SendResult {
-  const cfg = channelConfig(input.channel);
-  const now = nowISO();
+export async function sendCommunication(input: SendInput): Promise<SendResult> {
+  const cfg = await channelConfig(input.channel);
+  const now = await nowISO();
 
-  const insert = run(
+  const insert = await run(
     `INSERT INTO communications
        (channel, direction, provider, sender_id, recipient, customer_id, lead_id, worker_id, subject, body, status, created_at, updated_at)
      VALUES (?, 'OUTBOUND', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -93,26 +93,26 @@ export function sendCommunication(input: SendInput): SendResult {
       }
       const providerMessageId = body?.id ?? body?.message_id ?? null;
       if (res.ok) {
-        run('UPDATE communications SET status = ?, provider_message_id = ?, sent_at = ?, updated_at = ? WHERE id = ?', [
+        await run('UPDATE communications SET status = ?, provider_message_id = ?, sent_at = ?, updated_at = ? WHERE id = ?', [
           'SENT',
           providerMessageId ? String(providerMessageId) : null,
-          nowISO(),
-          nowISO(),
+          await nowISO(),
+          await nowISO(),
           id,
         ]);
       } else {
-        run('UPDATE communications SET status = ?, error = ?, updated_at = ? WHERE id = ?', [
+        await run('UPDATE communications SET status = ?, error = ?, updated_at = ? WHERE id = ?', [
           'FAILED',
           `Provider rejected the message (HTTP ${res.status}).`,
-          nowISO(),
+          await nowISO(),
           id,
         ]);
       }
     } catch (err) {
-      run('UPDATE communications SET status = ?, error = ?, updated_at = ? WHERE id = ?', [
+      await run('UPDATE communications SET status = ?, error = ?, updated_at = ? WHERE id = ?', [
         'FAILED',
         `Provider unreachable: ${(err as Error).message}`.slice(0, 300),
-        nowISO(),
+        await nowISO(),
         id,
       ]);
     }
@@ -123,8 +123,8 @@ export function sendCommunication(input: SendInput): SendResult {
   return { id, status: 'QUEUED', configured: true, provider: cfg.provider, error: null };
 }
 
-export function channelStatus(channel: Channel): { configured: boolean; provider: string; base_url: string; secret_present: boolean } {
-  const cfg = channelConfig(channel);
+export async function channelStatus(channel: Channel): Promise<{ configured: boolean; provider: string; base_url: string; secret_present: boolean }> {
+  const cfg = await channelConfig(channel);
   return {
     configured: cfg.provider !== 'none' && Boolean(cfg.base_url),
     provider: cfg.provider,

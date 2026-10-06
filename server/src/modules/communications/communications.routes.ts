@@ -49,7 +49,7 @@ const MSG_SELECT = `
 
 /* -------------------------------- LIST -------------------------------- */
 
-communicationsRouter.get('/', requireAuth, requirePermission('communications:read'), (req, res, next) => {
+communicationsRouter.get('/', requireAuth, requirePermission('communications:read'), async (req, res, next) => {
   try {
     const user = currentUser(req);
     const where: string[] = ['m.deleted_at IS NULL'];
@@ -86,7 +86,7 @@ communicationsRouter.get('/', requireAuth, requirePermission('communications:rea
     const search = String(req.query.search ?? '').trim();
     if (search) {
       where.push(`(m.recipient LIKE ? ESCAPE '\\' OR m.subject LIKE ? ESCAPE '\\' OR m.body LIKE ? ESCAPE '\\')`);
-      const term = likeTerm(search);
+      const term = await likeTerm(search);
       params.push(term, term, term);
     }
     const dates = resolvePeriodDates(
@@ -105,15 +105,15 @@ communicationsRouter.get('/', requireAuth, requirePermission('communications:rea
 
     const { page, limit, offset } = pagination(req.query, 20, 100);
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(
+    const total = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM communications m
          LEFT JOIN customers c ON c.id = m.customer_id
          LEFT JOIN leads l ON l.id = m.lead_id
          LEFT JOIN users w ON w.id = m.worker_id
          LEFT JOIN users s ON s.id = m.sender_id ${whereSql}`,
       params,
-    )!.c;
-    const rows = all(`${MSG_SELECT} ${whereSql} ORDER BY m.created_at DESC LIMIT ? OFFSET ?`, [
+    ))!.c;
+    const rows = await all(`${MSG_SELECT} ${whereSql} ORDER BY m.created_at DESC LIMIT ? OFFSET ?`, [
       ...params,
       limit,
       offset,
@@ -127,12 +127,12 @@ communicationsRouter.get('/', requireAuth, requirePermission('communications:rea
 /* ------------------------------- CHANNELS ----------------------------- */
 
 /** Which channels are actually wired up — the UI never fakes availability. */
-communicationsRouter.get('/channels', requireAuth, requirePermission('communications:read'), (_req, res, next) => {
+communicationsRouter.get('/channels', requireAuth, requirePermission('communications:read'), async (_req, res, next) => {
   try {
     ok(res, {
-      whatsapp: channelStatus('WHATSAPP'),
-      email: channelStatus('EMAIL'),
-      sms: channelStatus('SMS'),
+      whatsapp: await channelStatus('WHATSAPP'),
+      email: await channelStatus('EMAIL'),
+      sms: await channelStatus('SMS'),
       in_app: { configured: true, provider: 'internal', base_url: '', secret_present: false },
     });
   } catch (err) {
@@ -156,19 +156,19 @@ const sendSchema = z
     message: 'Provide lead_id, customer_id, worker_id, or an explicit recipient.',
   });
 
-function resolveRecipient(channel: string, input: any, req: any): string {
+async function resolveRecipient(channel: string, input: any, req: any): Promise<string> {
   if (input.recipient) return input.recipient;
   if (channel === 'IN_APP') {
     const target = input.worker_id;
     if (!target) throw badRequest('IN_APP messages need a worker_id.');
-    const user = get<{ id: number; email: string | null }>('SELECT id, email FROM users WHERE id = ? AND deleted_at IS NULL', [
+    const user = await get<{ id: number; email: string | null }>('SELECT id, email FROM users WHERE id = ? AND deleted_at IS NULL', [
       target,
     ]);
     if (!user) throw notFound('Worker not found.');
     return user.email || `user-${target}`;
   }
   if (input.lead_id) {
-    const lead = get<{ phone: string | null; email: string | null }>(
+    const lead = await get<{ phone: string | null; email: string | null }>(
       'SELECT c.phone, c.email FROM leads l JOIN customers c ON c.id = l.customer_id WHERE l.id = ?',
       [input.lead_id],
     );
@@ -182,7 +182,7 @@ function resolveRecipient(channel: string, input: any, req: any): string {
     return value;
   }
   if (input.customer_id) {
-    const customer = get<{ phone: string | null; email: string | null }>(
+    const customer = await get<{ phone: string | null; email: string | null }>(
       'SELECT phone, email FROM customers WHERE id = ? AND deleted_at IS NULL',
       [input.customer_id],
     );
@@ -198,14 +198,14 @@ function resolveRecipient(channel: string, input: any, req: any): string {
   throw badRequest('No recipient could be resolved.');
 }
 
-communicationsRouter.post('/', requireAuth, requirePermission('communications:send'), (req, res, next) => {
+communicationsRouter.post('/', requireAuth, requirePermission('communications:send'), async (req, res, next) => {
   try {
     const body = meta(sendSchema, req.body);
     const user = currentUser(req);
 
     // Access check when the message hangs off a lead/customer.
     if (body.lead_id) {
-      const lead = get<{ assigned_to: number | null }>(
+      const lead = await get<{ assigned_to: number | null }>(
         'SELECT assigned_to FROM leads WHERE id = ? AND deleted_at IS NULL',
         [body.lead_id],
       );
@@ -215,19 +215,19 @@ communicationsRouter.post('/', requireAuth, requirePermission('communications:se
       }
     }
     if (body.customer_id && !can(req, 'leads:read_all') && !body.lead_id) {
-      const owned = get<{ c: number }>(
+      const owned = await get<{ c: number }>(
         'SELECT COUNT(*) AS c FROM leads WHERE customer_id = ? AND assigned_to = ? AND deleted_at IS NULL',
         [body.customer_id, user.id],
       );
       if (!owned?.c) throw forbidden('You do not have access to this customer.');
     }
 
-    const recipient = resolveRecipient(body.channel, body, req);
+    const recipient = await resolveRecipient(body.channel, body, req);
 
     if (body.channel === 'IN_APP') {
-      const now = nowISO();
+      const now = await nowISO();
       const targetWorker = body.worker_id!;
-      const id = run(
+      const id = (await run(
         `INSERT INTO communications
            (channel, direction, provider, sender_id, recipient, customer_id, lead_id, worker_id, subject, body,
             status, sent_at, created_at, updated_at)
@@ -244,9 +244,9 @@ communicationsRouter.post('/', requireAuth, requirePermission('communications:se
           now,
           now,
         ],
-      ).lastInsertRowid;
+      )).lastInsertRowid;
 
-      notify({
+      await notify({
         userId: targetWorker,
         type: 'MESSAGE_RECEIVED',
         title: body.subject || `Message from ${user.name}`,
@@ -256,9 +256,9 @@ communicationsRouter.post('/', requireAuth, requirePermission('communications:se
         link: body.lead_id ? `/leads/${body.lead_id}` : '/inbox',
       });
 
-      audit(req, 'MESSAGE_SENT', 'communication', id, { channel: 'IN_APP', recipient });
+      await audit(req, 'MESSAGE_SENT', 'communication', id, { channel: 'IN_APP', recipient });
       if (body.lead_id) {
-        addTimelineEvent({
+        await addTimelineEvent({
           leadId: body.lead_id,
           type: TIMELINE_TYPES.MESSAGE_SENT,
           actorId: user.id,
@@ -266,12 +266,12 @@ communicationsRouter.post('/', requireAuth, requirePermission('communications:se
           metadata: { communication_id: id, channel: 'IN_APP' },
         });
       }
-      const row = get(`${MSG_SELECT} WHERE m.id = ?`, [id]);
+      const row = await get(`${MSG_SELECT} WHERE m.id = ?`, [id]);
       created(res, { ...shapeMessage(row!), configured: true, reason: null });
       return;
     }
 
-    const result = sendCommunication({
+    const result = await sendCommunication({
       channel: body.channel as Channel,
       recipient,
       body: body.body,
@@ -282,14 +282,14 @@ communicationsRouter.post('/', requireAuth, requirePermission('communications:se
       workerId: body.worker_id ?? null,
     });
 
-    audit(req, 'MESSAGE_SENT', 'communication', result.id, {
+    await audit(req, 'MESSAGE_SENT', 'communication', result.id, {
       channel: body.channel,
       configured: result.configured,
       status: result.status,
     });
 
     if (body.lead_id) {
-      addTimelineEvent({
+      await addTimelineEvent({
         leadId: body.lead_id,
         type: TIMELINE_TYPES.MESSAGE_SENT,
         actorId: user.id,
@@ -300,7 +300,7 @@ communicationsRouter.post('/', requireAuth, requirePermission('communications:se
       });
     }
 
-    const row = get(`${MSG_SELECT} WHERE m.id = ?`, [result.id]);
+    const row = await get(`${MSG_SELECT} WHERE m.id = ?`, [result.id]);
     created(res, {
       ...shapeMessage(row!),
       configured: result.configured,
@@ -313,15 +313,15 @@ communicationsRouter.post('/', requireAuth, requirePermission('communications:se
 
 /* -------------------------------- DETAIL ------------------------------ */
 
-communicationsRouter.get('/:id(\\d+)', requireAuth, requirePermission('communications:read'), (req, res, next) => {
+communicationsRouter.get('/:id(\\d+)', requireAuth, requirePermission('communications:read'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const row = get(`${MSG_SELECT} WHERE m.id = ? AND m.deleted_at IS NULL`, [id]);
+    const row = await get(`${MSG_SELECT} WHERE m.id = ? AND m.deleted_at IS NULL`, [id]);
     if (!row) throw notFound('Message not found.');
     const user = currentUser(req);
     let allowed = can(req, 'leads:read_all') || row.worker_id === user.id || row.sender_id === user.id;
     if (!allowed && row.lead_id) {
-      const lead = get<{ assigned_to: number | null }>('SELECT assigned_to FROM leads WHERE id = ?', [row.lead_id]);
+      const lead = await get<{ assigned_to: number | null }>('SELECT assigned_to FROM leads WHERE id = ?', [row.lead_id]);
       allowed = lead?.assigned_to === user.id;
     }
     if (!allowed) throw forbidden('You do not have access to this message.');

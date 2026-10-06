@@ -52,10 +52,10 @@ function duplicateWhere(field: 'phone' | 'whatsapp' | 'email', value: string) {
   return null;
 }
 
-export function findDuplicates(
+export async function findDuplicates(
   input: { phone?: string | null; whatsapp?: string | null; email?: string | null },
   excludeId?: number,
-): Array<Record<string, any>> {
+): Promise<Array<Record<string, any>>> {
   const clauses: string[] = [];
   const params: unknown[] = [];
   for (const field of ['phone', 'whatsapp', 'email'] as const) {
@@ -74,14 +74,15 @@ export function findDuplicates(
     sql += ' AND c.id <> ?';
     params.push(excludeId);
   }
-  return all(sql, params);
+  return await all(sql, params);
 }
 
 /** GET /api/customers/check-duplicate — warn before creating/updating. */
-customersRouter.get('/check-duplicate', requireAuth, (req, res, next) => {
+customersRouter.get('/check-duplicate', requireAuth, async (req, res, next) => {
   try {
+    if (!can(req, 'customers:manage') && !can(req, 'leads:create')) throw forbidden();
     const excludeId = req.query.exclude_id ? Number(req.query.exclude_id) : undefined;
-    const matches = findDuplicates(
+    const matches = await findDuplicates(
       {
         phone: String(req.query.phone ?? ''),
         whatsapp: String(req.query.whatsapp ?? ''),
@@ -89,6 +90,7 @@ customersRouter.get('/check-duplicate', requireAuth, (req, res, next) => {
       },
       excludeId,
     );
+    await audit(req, 'CUSTOMER_DUPLICATE_CHECKED', 'customer', excludeId ?? null, { matches: matches.length });
     ok(res, { duplicates: matches, is_duplicate: matches.length > 0 });
   } catch (err) {
     next(err);
@@ -96,7 +98,7 @@ customersRouter.get('/check-duplicate', requireAuth, (req, res, next) => {
 });
 
 /** GET /api/customers — searchable, paginated customer list. */
-customersRouter.get('/', requireAuth, (req, res, next) => {
+customersRouter.get('/', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     const { page, limit, offset } = pagination(req.query);
@@ -118,7 +120,7 @@ customersRouter.get('/', requireAuth, (req, res, next) => {
         `(c.name LIKE ? ESCAPE '\\' OR c.phone LIKE ? ESCAPE '\\' OR c.whatsapp LIKE ? ESCAPE '\\'
           OR c.email LIKE ? ESCAPE '\\' OR c.city LIKE ? ESCAPE '\\')`,
       );
-      const term = likeTerm(search);
+      const term = await likeTerm(search);
       params.push(term, term, term, term, term);
     }
 
@@ -129,12 +131,12 @@ customersRouter.get('/', requireAuth, (req, res, next) => {
     }
 
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(`SELECT COUNT(*) AS c FROM customers c ${whereSql}`, params)!.c;
+    const total = (await get<{ c: number }>(`SELECT COUNT(*) AS c FROM customers c ${whereSql}`, params))!.c;
 
     const order =
       sort === 'name' ? 'c.name COLLATE NOCASE ASC' : sort === 'oldest' ? 'c.created_at ASC' : 'c.created_at DESC';
 
-    const rows = all(
+    const rows = await all(
       `SELECT c.*,
               (SELECT COUNT(*) FROM leads l WHERE l.customer_id = c.id AND l.deleted_at IS NULL) AS lead_count,
               (SELECT MAX(l.created_at) FROM leads l WHERE l.customer_id = c.id AND l.deleted_at IS NULL) AS last_lead_at
@@ -151,16 +153,16 @@ customersRouter.get('/', requireAuth, (req, res, next) => {
 });
 
 /** POST /api/customers — create a customer (duplicate-aware). */
-customersRouter.post('/', requireAuth, requirePermission('customers:manage'), (req, res, next) => {
+customersRouter.post('/', requireAuth, requirePermission('customers:manage'), async (req, res, next) => {
   try {
     const body = meta(customerSchema, req.body);
-    const duplicates = findDuplicates(body);
+    const duplicates = await findDuplicates(body);
     if (duplicates.length && !body.allow_duplicate) {
       throw conflict('Possible duplicate customer found.', { duplicates });
     }
 
-    const now = nowISO();
-    const id = run(
+    const now = await nowISO();
+    const id = (await run(
       `INSERT INTO customers (name, phone, whatsapp, email, city, state, country, notes, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -176,10 +178,10 @@ customersRouter.post('/', requireAuth, requirePermission('customers:manage'), (r
         now,
         now,
       ],
-    ).lastInsertRowid;
+    )).lastInsertRowid;
 
-    audit(req, 'CUSTOMER_CREATED', 'customer', id, { name: body.name, duplicates: duplicates.length });
-    const row = get('SELECT * FROM customers WHERE id = ?', [id]);
+    await audit(req, 'CUSTOMER_CREATED', 'customer', id, { name: body.name, duplicates: duplicates.length });
+    const row = await get('SELECT * FROM customers WHERE id = ?', [id]);
     created(res, shape({ ...row!, lead_count: 0 }));
   } catch (err) {
     next(err);
@@ -187,15 +189,15 @@ customersRouter.post('/', requireAuth, requirePermission('customers:manage'), (r
 });
 
 /** GET /api/customers/:id — customer profile with its leads. */
-customersRouter.get('/:id', requireAuth, (req, res, next) => {
+customersRouter.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     const id = Number(req.params.id);
-    const row = get<any>('SELECT * FROM customers WHERE id = ? AND deleted_at IS NULL', [id]);
+    const row = await get<any>('SELECT * FROM customers WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!row) throw notFound('Customer not found.');
 
     const readAll = can(req, 'customers:read_all');
-    const leads = all(
+    const leads = await all(
       `SELECT l.id, l.lead_number, l.destination, l.travel_type, l.trip_type, l.priority, l.budget, l.currency,
               l.created_at, l.next_follow_up_at, s.code AS status_code, s.name AS status_name, s.category AS status_category,
               s.color AS status_color, u.name AS assignee_name, l.assigned_to
@@ -209,7 +211,7 @@ customersRouter.get('/:id', requireAuth, (req, res, next) => {
     );
 
     if (!readAll && leads.length === 0) {
-      const owned = get('SELECT 1 FROM leads WHERE customer_id = ? AND assigned_to = ? AND deleted_at IS NULL', [
+      const owned = await get('SELECT 1 FROM leads WHERE customer_id = ? AND assigned_to = ? AND deleted_at IS NULL', [
         id,
         user.id,
       ]);
@@ -237,7 +239,7 @@ customersRouter.get('/:id', requireAuth, (req, res, next) => {
         },
         assignee: l.assigned_to ? { id: l.assigned_to, name: l.assignee_name } : null,
       })),
-      duplicates: findDuplicates(row, id),
+      duplicates: await findDuplicates(row, id),
     });
   } catch (err) {
     next(err);
@@ -245,10 +247,10 @@ customersRouter.get('/:id', requireAuth, (req, res, next) => {
 });
 
 /** PATCH /api/customers/:id */
-customersRouter.patch('/:id', requireAuth, requirePermission('customers:manage'), (req, res, next) => {
+customersRouter.patch('/:id', requireAuth, requirePermission('customers:manage'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const existing = get<any>('SELECT * FROM customers WHERE id = ? AND deleted_at IS NULL', [id]);
+    const existing = await get<any>('SELECT * FROM customers WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!existing) throw notFound('Customer not found.');
 
     const body = meta(updateSchema, req.body);
@@ -257,12 +259,12 @@ customersRouter.patch('/:id', requireAuth, requirePermission('customers:manage')
       whatsapp: body.whatsapp !== undefined ? body.whatsapp : existing.whatsapp,
       email: body.email !== undefined ? body.email : existing.email,
     };
-    const duplicates = findDuplicates(merged, id);
+    const duplicates = await findDuplicates(merged, id);
     if (duplicates.length && !body.allow_duplicate) {
       throw conflict('Possible duplicate customer found.', { duplicates });
     }
 
-    run(
+    await run(
       `UPDATE customers SET name = ?, phone = ?, whatsapp = ?, email = ?, city = ?, state = ?, country = ?, notes = ?,
         updated_at = ? WHERE id = ?`,
       [
@@ -274,32 +276,32 @@ customersRouter.patch('/:id', requireAuth, requirePermission('customers:manage')
         body.state !== undefined ? body.state : existing.state,
         body.country !== undefined ? body.country : existing.country,
         body.notes !== undefined ? body.notes : existing.notes,
-        nowISO(),
+        await nowISO(),
         id,
       ],
     );
 
-    audit(req, 'CUSTOMER_UPDATED', 'customer', id, { changed: Object.keys(body) });
-    const row = get('SELECT * FROM customers WHERE id = ?', [id]);
-    ok(res, shape({ ...row!, lead_count: Number(get<{ c: number }>('SELECT COUNT(*) AS c FROM leads WHERE customer_id = ? AND deleted_at IS NULL', [id])?.c ?? 0) }));
+    await audit(req, 'CUSTOMER_UPDATED', 'customer', id, { changed: Object.keys(body) });
+    const row = await get('SELECT * FROM customers WHERE id = ?', [id]);
+    ok(res, shape({ ...row!, lead_count: Number((await get<{ c: number }>('SELECT COUNT(*) AS c FROM leads WHERE customer_id = ? AND deleted_at IS NULL', [id]))?.c ?? 0) }));
   } catch (err) {
     next(err);
   }
 });
 
 /** POST /api/customers/:id/archive — soft-archive (history preserved). */
-customersRouter.post('/:id/archive', requireAuth, requirePermission('customers:manage'), (req, res, next) => {
+customersRouter.post('/:id/archive', requireAuth, requirePermission('customers:manage'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const existing = get<any>('SELECT * FROM customers WHERE id = ? AND deleted_at IS NULL', [id]);
+    const existing = await get<any>('SELECT * FROM customers WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!existing) throw notFound('Customer not found.');
-    const activeLeads = get<{ c: number }>('SELECT COUNT(*) AS c FROM leads WHERE customer_id = ? AND deleted_at IS NULL', [
+    const activeLeads = await get<{ c: number }>('SELECT COUNT(*) AS c FROM leads WHERE customer_id = ? AND deleted_at IS NULL', [
       id,
     ]);
     if (activeLeads && activeLeads.c > 0) throw conflict('Customer has active leads and cannot be archived.');
 
-    run('UPDATE customers SET deleted_at = ?, updated_at = ? WHERE id = ?', [nowISO(), nowISO(), id]);
-    audit(req, 'CUSTOMER_ARCHIVED', 'customer', id, { name: existing.name });
+    await run('UPDATE customers SET deleted_at = ?, updated_at = ? WHERE id = ?', [await nowISO(), await nowISO(), id]);
+    await audit(req, 'CUSTOMER_ARCHIVED', 'customer', id, { name: existing.name });
     ok(res, { archived: true });
   } catch (err) {
     next(err);

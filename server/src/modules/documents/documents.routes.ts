@@ -33,12 +33,20 @@ function shapeDocument(row: Record<string, any>): Record<string, any> {
 }
 
 /** Access mirrors the parent record's access rules. */
-function assertEntityAccess(entity: string, entityId: number, req: any): void {
+async function assertEntityAccess(entity: string, entityId: number, req: any, opts?: { forWrite?: boolean }): Promise<void> {
   const user = req.user!;
-  if (entity === 'GENERAL') return;
+  if (entity === 'GENERAL') {
+    // General files have no parent record: writes go to your own uploads,
+    // reads are limited to managers.
+    if (opts?.forWrite) return;
+    if (!user.permissions.includes('documents:manage')) {
+      throw forbidden('General documents are restricted to administrators.');
+    }
+    return;
+  }
 
   if (entity === 'LEAD') {
-    const lead = get<{ assigned_to: number | null }>(
+    const lead = await get<{ assigned_to: number | null }>(
       'SELECT assigned_to FROM leads WHERE id = ? AND deleted_at IS NULL',
       [entityId],
     );
@@ -50,10 +58,10 @@ function assertEntityAccess(entity: string, entityId: number, req: any): void {
   }
 
   if (entity === 'CUSTOMER') {
-    const customer = get<{ id: number }>('SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL', [entityId]);
+    const customer = await get<{ id: number }>('SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL', [entityId]);
     if (!customer) throw notFound('Customer not found.');
     if (!user.permissions.includes('leads:read_all')) {
-      const owned = get<{ c: number }>(
+      const owned = await get<{ c: number }>(
         'SELECT COUNT(*) AS c FROM leads WHERE customer_id = ? AND assigned_to = ? AND deleted_at IS NULL',
         [entityId, user.id],
       );
@@ -64,7 +72,7 @@ function assertEntityAccess(entity: string, entityId: number, req: any): void {
 
   if (entity === 'QUOTATION' || entity === 'BOOKING') {
     const table = entity === 'QUOTATION' ? 'quotations' : 'bookings';
-    const row = get<{ worker_id: number | null; created_by: number | null }>(
+    const row = await get<{ worker_id: number | null; created_by: number | null }>(
       `SELECT worker_id, created_by FROM ${table} WHERE id = ? AND deleted_at IS NULL`,
       [entityId],
     );
@@ -77,7 +85,7 @@ function assertEntityAccess(entity: string, entityId: number, req: any): void {
   }
 
   if (entity === 'CALL') {
-    const call = get<{ worker_id: number }>('SELECT worker_id FROM calls WHERE id = ? AND deleted_at IS NULL', [
+    const call = await get<{ worker_id: number }>('SELECT worker_id FROM calls WHERE id = ? AND deleted_at IS NULL', [
       entityId,
     ]);
     if (!call) throw notFound('Call not found.');
@@ -89,13 +97,18 @@ function assertEntityAccess(entity: string, entityId: number, req: any): void {
 
 /* -------------------------------- LIST -------------------------------- */
 
-documentsRouter.get('/', requireAuth, requirePermission('documents:read'), (req, res, next) => {
+documentsRouter.get('/', requireAuth, requirePermission('documents:read'), async (req, res, next) => {
   try {
     const entity = String(req.query.entity ?? '').trim().toUpperCase();
     const entityId = Number(req.query.entity_id);
+    const isManager = can(req, 'documents:manage');
     const where: string[] = ['d.deleted_at IS NULL'];
     const params: unknown[] = [];
 
+    if (!isManager) {
+      // Scoped listing only: a caller must name the parent record they can access.
+      if (!entity || !entityId) throw badRequest('entity and entity_id are required.');
+    }
     if (entity) {
       if (!ENTITIES.includes(entity as any)) throw badRequest('Unknown entity.');
       where.push('d.entity = ?');
@@ -103,8 +116,10 @@ documentsRouter.get('/', requireAuth, requirePermission('documents:read'), (req,
       if (entityId) {
         where.push('d.entity_id = ?');
         params.push(entityId);
-        assertEntityAccess(entity, entityId, req);
+        await assertEntityAccess(entity, entityId, req);
       }
+    } else if (isManager) {
+      await audit(req, 'DOCUMENT_LISTED', 'document', null, { scope: 'all' });
     }
 
     const categories = toArray(req.query.category);
@@ -120,8 +135,8 @@ documentsRouter.get('/', requireAuth, requirePermission('documents:read'), (req,
 
     const { page, limit, offset } = pagination(req.query, 20, 100);
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(`SELECT COUNT(*) AS c FROM documents d ${whereSql}`, params)!.c;
-    const rows = all(
+    const total = (await get<{ c: number }>(`SELECT COUNT(*) AS c FROM documents d ${whereSql}`, params))!.c;
+    const rows = await all(
       `SELECT d.*, u.name AS uploaded_by_name FROM documents d
          LEFT JOIN users u ON u.id = d.uploaded_by ${whereSql}
        ORDER BY d.created_at DESC LIMIT ? OFFSET ?`,
@@ -144,14 +159,14 @@ const uploadSchema = z.object({
   content_base64: z.string().min(1).max(14_000_000),
 });
 
-documentsRouter.post('/', requireAuth, requirePermission('documents:upload'), (req, res, next) => {
+documentsRouter.post('/', requireAuth, requirePermission('documents:upload'), async (req, res, next) => {
   try {
     const body = meta(uploadSchema, req.body);
-    assertEntityAccess(body.entity, body.entity_id, req);
+    await assertEntityAccess(body.entity, body.entity_id, req, { forWrite: true });
     const user = currentUser(req);
     const parsed = parseBase64(body.content_base64);
 
-    const saved = saveDocument({
+    const saved = await saveDocument({
       entity: body.entity,
       entityId: body.entity_id,
       category: body.category ?? null,
@@ -161,8 +176,8 @@ documentsRouter.post('/', requireAuth, requirePermission('documents:upload'), (r
       uploadedBy: user.id,
     });
 
-    afterUpload(body.entity, body.entity_id, saved.id, user.id, req);
-    const row = get(
+    await afterUpload(body.entity, body.entity_id, saved.id, user.id, req);
+    const row = await get(
       `SELECT d.*, u.name AS uploaded_by_name FROM documents d LEFT JOIN users u ON u.id = d.uploaded_by WHERE d.id = ?`,
       [saved.id],
     );
@@ -187,7 +202,7 @@ documentsRouter.post(
       if (!ENTITIES.includes(entity as any)) throw badRequest('A valid X-Entity header is required.');
       const entityId = Number(req.header('x-entity-id'));
       if (!entityId) throw badRequest('An X-Entity-Id header is required.');
-      assertEntityAccess(entity, entityId, req);
+      await assertEntityAccess(entity, entityId, req, { forWrite: true });
 
       const content = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
       if (!content.length) throw badRequest('No file bytes were received.');
@@ -196,7 +211,7 @@ documentsRouter.post(
       const mime = String(req.header('x-mime-type') || 'application/octet-stream').slice(0, 120);
       const category = String(req.header('x-category') || '').slice(0, 60) || null;
 
-      const saved = saveDocument({
+      const saved = await saveDocument({
         entity: entity as (typeof ENTITIES)[number],
         entityId,
         category,
@@ -206,8 +221,8 @@ documentsRouter.post(
         uploadedBy: user.id,
       });
 
-      afterUpload(entity, entityId, saved.id, user.id, req);
-      const row = get(
+      await afterUpload(entity, entityId, saved.id, user.id, req);
+      const row = await get(
         `SELECT d.*, u.name AS uploaded_by_name FROM documents d LEFT JOIN users u ON u.id = d.uploaded_by WHERE d.id = ?`,
         [saved.id],
       );
@@ -218,10 +233,10 @@ documentsRouter.post(
   },
 );
 
-function afterUpload(entity: string, entityId: number, docId: number, actorId: number, req: any): void {
-  audit(req, 'DOCUMENT_UPLOADED', 'document', docId, { entity, entity_id: entityId });
+async function afterUpload(entity: string, entityId: number, docId: number, actorId: number, req: any): Promise<void> {
+  await audit(req, 'DOCUMENT_UPLOADED', 'document', docId, { entity, entity_id: entityId });
   if (entity === 'LEAD') {
-    addTimelineEvent({
+    await addTimelineEvent({
       leadId: entityId,
       type: TIMELINE_TYPES.DOCUMENT_UPLOADED,
       actorId,
@@ -233,13 +248,20 @@ function afterUpload(entity: string, entityId: number, docId: number, actorId: n
 
 /* -------------------------------- DETAIL ------------------------------ */
 
-documentsRouter.get('/:id(\\d+)', requireAuth, requirePermission('documents:read'), (req, res, next) => {
+documentsRouter.get('/:id(\\d+)', requireAuth, requirePermission('documents:read'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const row = get<any>('SELECT * FROM documents WHERE id = ? AND deleted_at IS NULL', [id]);
+    const row = await get<any>('SELECT * FROM documents WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!row) throw notFound('Document not found.');
-    assertEntityAccess(row.entity, row.entity_id, req);
-    const full = get(
+    if (row.entity === 'GENERAL') {
+      const user = currentUser(req);
+      if (!user.permissions.includes('documents:manage') && row.uploaded_by !== user.id) {
+        throw forbidden('You do not have access to this document.');
+      }
+    } else {
+      await assertEntityAccess(row.entity, row.entity_id, req);
+    }
+    const full = await get(
       `SELECT d.*, u.name AS uploaded_by_name FROM documents d LEFT JOIN users u ON u.id = d.uploaded_by WHERE d.id = ?`,
       [id],
     );
@@ -255,16 +277,23 @@ documentsRouter.get('/:id(\\d+)/file', requireAuth, requirePermission('documents
   void (async () => {
     try {
       const id = Number(req.params.id);
-      const row = get<DocumentRow>('SELECT * FROM documents WHERE id = ? AND deleted_at IS NULL', [id]);
+      const row = await get<DocumentRow>('SELECT * FROM documents WHERE id = ? AND deleted_at IS NULL', [id]);
       if (!row) throw notFound('Document not found.');
-      assertEntityAccess(row.entity, row.entity_id, req);
+      if (row.entity === 'GENERAL') {
+        const user = currentUser(req);
+        if (!user.permissions.includes('documents:manage') && row.uploaded_by !== user.id) {
+          throw forbidden('You do not have access to this document.');
+        }
+      } else {
+        await assertEntityAccess(row.entity, row.entity_id, req);
+      }
 
       const { documentPath } = await import('../../services/documents.js');
       const fs = await import('node:fs');
       const file = documentPath(row);
       if (!fs.existsSync(file)) throw notFound('The file is missing from storage.');
 
-      audit(req, 'DOCUMENT_ACCESSED', 'document', row.id, { entity: row.entity, entity_id: row.entity_id });
+      await audit(req, 'DOCUMENT_ACCESSED', 'document', row.id, { entity: row.entity, entity_id: row.entity_id });
       res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
       res.setHeader('Content-Disposition', `attachment; filename="${row.filename.replace(/"/g, '')}"`);
       res.setHeader('Cache-Control', 'private, no-store');
@@ -278,21 +307,30 @@ documentsRouter.get('/:id(\\d+)/file', requireAuth, requirePermission('documents
 
 /* -------------------------------- DELETE ------------------------------ */
 
-documentsRouter.delete('/:id(\\d+)', requireAuth, (req, res, next) => {
+documentsRouter.delete('/:id(\\d+)', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const row = get<DocumentRow>('SELECT * FROM documents WHERE id = ? AND deleted_at IS NULL', [id]);
+    const row = await get<DocumentRow>('SELECT * FROM documents WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!row) throw notFound('Document not found.');
     const user = currentUser(req);
     const isUploader = row.uploaded_by === user.id;
-    if (!user.permissions.includes('documents:manage') && !isUploader) {
+    const isManager = user.permissions.includes('documents:manage');
+    if (!isManager && !isUploader) {
       throw forbidden('Only the uploader or an admin can delete this document.');
     }
+    // A non-manager uploader must still have access to the parent record.
+    if (!isManager) {
+      if (row.entity === 'GENERAL') {
+        /* uploader restriction already enforced above */
+      } else {
+        await assertEntityAccess(row.entity, row.entity_id, req);
+      }
+    }
 
-    const now = nowISO();
-    run('UPDATE documents SET deleted_at = ? WHERE id = ?', [now, id]);
+    const now = await nowISO();
+    await run('UPDATE documents SET deleted_at = ? WHERE id = ?', [now, id]);
     deleteDocumentFile(row);
-    audit(req, 'DOCUMENT_DELETED', 'document', id, { entity: row.entity, entity_id: row.entity_id });
+    await audit(req, 'DOCUMENT_DELETED', 'document', id, { entity: row.entity, entity_id: row.entity_id });
     ok(res, { deleted: true });
   } catch (err) {
     next(err);

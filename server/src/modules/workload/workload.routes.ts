@@ -13,7 +13,7 @@ const TERMINAL_SQL = `('COMPLETED','CONVERTED','NOT_INTERESTED','CANCELLED')`;
  * GET /api/workload — daily lead workload per worker.
  * Query: period, date_from, date_to, worker_id
  */
-workloadRouter.get('/', requireAuth, (req, res, next) => {
+workloadRouter.get('/', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     const readAll = can(req, 'leads:read_all') || can(req, 'dashboard:admin');
@@ -49,7 +49,7 @@ workloadRouter.get('/', requireAuth, (req, res, next) => {
       params.push(`%${search.replace(/[%_]/g, (m: string) => `\\${m}`)}%`);
     }
 
-    const workers = all<{ id: number; name: string; email: string; status: string }>(
+    const workers = await all<{ id: number; name: string; email: string; status: string }>(
       `SELECT u.id, u.name, u.email, u.status
        FROM users u JOIN roles r ON r.id = u.role_id
        WHERE ${where.join(' AND ')}
@@ -57,7 +57,8 @@ workloadRouter.get('/', requireAuth, (req, res, next) => {
       params,
     );
 
-    const rows = workers.map((w) => {
+    const rows = await Promise.all(
+      workers.map(async (w) => {
       const assignmentWhere: string[] = ['a.assigned_to = ?', 'a.is_active = 1', 'l.deleted_at IS NULL'];
       const assignmentParams: unknown[] = [w.id];
       if (dates.from) {
@@ -69,7 +70,7 @@ workloadRouter.get('/', requireAuth, (req, res, next) => {
         assignmentParams.push(`${dates.to}T00:00:00.000Z`);
       }
 
-      const counts = get<any>(
+      const counts = (await get<any>(
         `SELECT
           COUNT(*) AS assigned,
           SUM(CASE WHEN s.category IN ('WON','LOST') THEN 1 ELSE 0 END) AS completed,
@@ -84,16 +85,16 @@ workloadRouter.get('/', requireAuth, (req, res, next) => {
          JOIN lead_statuses s ON s.id = l.status_id
          WHERE ${assignmentWhere.join(' AND ')}`,
         assignmentParams,
-      )!;
+      ))!;
 
-      const fu = get<any>(
+      const fu = (await get<any>(
         `SELECT
            SUM(CASE WHEN scheduled_date = '${today}' AND status NOT IN ${TERMINAL_SQL} THEN 1 ELSE 0 END) AS today,
            SUM(CASE WHEN scheduled_date < '${today}' AND status NOT IN ${TERMINAL_SQL} THEN 1 ELSE 0 END) AS overdue,
            SUM(CASE WHEN status IN ('COMPLETED','CONVERTED') THEN 1 ELSE 0 END) AS done
          FROM follow_ups WHERE worker_id = ? AND deleted_at IS NULL`,
         [w.id],
-      )!;
+      ))!;
 
       return {
         worker_id: w.id,
@@ -109,7 +110,8 @@ workloadRouter.get('/', requireAuth, (req, res, next) => {
         follow_ups_overdue: Number(fu.overdue ?? 0),
         follow_ups_done: Number(fu.done ?? 0),
       };
-    });
+      }),
+    );
 
     ok(res, {
       period: dates,
@@ -144,15 +146,16 @@ workloadRouter.get('/', requireAuth, (req, res, next) => {
 /**
  * GET /api/workload/today — today's lead queue for a worker (self or any worker for admin).
  */
-workloadRouter.get('/today', requireAuth, (req, res, next) => {
+workloadRouter.get('/today', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
-    const readAll = can(req, 'leads:read_all');
+    const readAll = can(req, 'leads:read_all') || can(req, 'dashboard:admin');
+    if (!readAll && !can(req, 'leads:read_own')) throw forbidden();
     const requested = Number(req.query.worker_id) || user.id;
     if (!readAll && requested !== user.id) throw forbidden();
     const today = todayStr();
 
-    const rows = all(
+    const rows = await all(
       `SELECT l.id, l.lead_number, l.destination, l.priority, l.travel_start_date, l.budget, l.currency,
               l.created_at, l.next_follow_up_at, c.name AS customer_name, c.phone AS customer_phone,
               s.code AS status_code, s.name AS status_name, s.color AS status_color,

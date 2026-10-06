@@ -3,16 +3,16 @@ import { config } from './config.js';
 import { migrate } from './db/migrate.js';
 import { seed } from './db/seed.js';
 
-function main(): void {
-  migrate();
-  seed();
+async function main(): Promise<void> {
+  await migrate();
+  await seed();
 
   const app = createApp();
   const server = app.listen(config.port, config.host, () => {
     console.log(`[crm] API server listening on http://localhost:${config.port}`);
     console.log(`[crm] environment: ${config.nodeEnv}`);
     if (config.nodeEnv === 'development') {
-      console.log(`[crm] admin login: ${config.admin.email} / ${config.admin.password}`);
+      console.log(`[crm] admin login: ${config.admin.email} (set ADMIN_PASSWORD to change the password)`);
     }
   });
 
@@ -25,4 +25,4 @@ function main(): void {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-main();
+await main();

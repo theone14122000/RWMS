@@ -50,32 +50,43 @@ export default function LeadDetail() {
   const [busy, setBusy] = useState(false);
 
   const { data, loading, error, reload } = useQuery<any>(`/api/leads/${leadId}`, [reloadKey]);
-  const { data: timeline, reload: reloadTimeline } = useQuery<{ data: any[] }>(`/api/leads/${leadId}/timeline`, [reloadKey]);
-  const { data: notes, reload: reloadNotes } = useQuery<{ data: any[] }>(`/api/leads/${leadId}/notes`, [reloadKey]);
-  const { data: assignments, reload: reloadAssignments } = useQuery<{ data: any[] }>(
+  const { data: timeline, error: timelineErr, reload: reloadTimeline } = useQuery<{ data: any[] }>(`/api/leads/${leadId}/timeline`, [reloadKey]);
+  const { data: notes, error: notesErr, reload: reloadNotes } = useQuery<{ data: any[] }>(`/api/leads/${leadId}/notes`, [reloadKey]);
+  const { data: assignments, error: assignmentsErr, reload: reloadAssignments } = useQuery<{ data: any[] }>(
     `/api/leads/${leadId}/assignments`,
     [reloadKey],
   );
-  const { data: followUps, reload: reloadFollowUps } = useQuery<{ data: any[] }>(
+  const { data: followUps, error: followUpsErr, reload: reloadFollowUps } = useQuery<{ data: any[] }>(
     `/api/follow-ups${qs({ lead_id: leadId, limit: 50 })}`,
     [reloadKey],
   );
-  const { data: calls, reload: reloadCalls } = useQuery<{ data: any[] }>(
+  const { data: calls, error: callsErr, reload: reloadCalls } = useQuery<{ data: any[] }>(
     `/api/calls${qs({ lead_id: leadId, limit: 50 })}`,
     [reloadKey],
   );
-  const { data: quotations, reload: reloadQuotations } = useQuery<{ data: any[] }>(
+  const { data: quotations, error: quotationsErr, reload: reloadQuotations } = useQuery<{ data: any[] }>(
     `/api/quotations${qs({ lead_id: leadId, limit: 50 })}`,
     [reloadKey],
   );
-  const { data: documents, reload: reloadDocuments } = useQuery<{ data: any[] }>(
+  const { data: documents, error: documentsErr, reload: reloadDocuments } = useQuery<{ data: any[] }>(
     `/api/documents${qs({ entity: 'LEAD', entity_id: leadId, limit: 50 })}`,
     [reloadKey],
   );
-  const { data: messages, reload: reloadMessages } = useQuery<{ data: any[] }>(
+  const { data: messages, error: messagesErr, reload: reloadMessages } = useQuery<{ data: any[] }>(
     `/api/communications${qs({ lead_id: leadId, limit: 50 })}`,
     [reloadKey],
   );
+
+  const secondaryErrors = [
+    ['Timeline', timelineErr, reloadTimeline],
+    ['Notes', notesErr, reloadNotes],
+    ['Assignments', assignmentsErr, reloadAssignments],
+    ['Follow-ups', followUpsErr, reloadFollowUps],
+    ['Calls', callsErr, reloadCalls],
+    ['Quotations', quotationsErr, reloadQuotations],
+    ['Documents', documentsErr, reloadDocuments],
+    ['Messages', messagesErr, reloadMessages],
+  ].filter(([, err]) => Boolean(err)) as Array<[string, string, () => void]>;
 
   const reloadAll = () => setReloadKey((k) => k + 1);
 
@@ -168,7 +179,31 @@ export default function LeadDetail() {
         </div>
       </div>
 
-      <div className="grid-2" style={{ gridTemplateColumns: '2fr 1fr', alignItems: 'start' }}>
+      {secondaryErrors.length ? (
+        <div
+          style={{
+            background: 'var(--danger-50)',
+            color: 'var(--danger)',
+            padding: '9px 12px',
+            borderRadius: 8,
+            fontSize: 13,
+            marginBottom: 14,
+          }}
+        >
+          Could not load {secondaryErrors.map(([label]) => label).join(', ')}:{' '}
+          {secondaryErrors[0][1]}
+          <button
+            type="button"
+            className="btn btn-sm"
+            style={{ marginLeft: 10 }}
+            onClick={() => secondaryErrors.forEach(([, , retry]) => retry())}
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
+
+      <div className="grid-2-main">
         <div className="stack">
           <Tabs
             active={tab}

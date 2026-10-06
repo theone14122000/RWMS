@@ -21,11 +21,26 @@ export interface AutomationRun {
 
 const TERMINAL_SQL = `('COMPLETED','CONVERTED','NOT_INTERESTED','CANCELLED')`;
 
-export function notifyDueFollowUps(): number {
-  const { enabled } = reminderConfig();
+/**
+ * Removes expired sessions and stale password-reset tokens so the auth tables
+ * do not grow without bound (also purges used tokens after a grace period).
+ */
+export async function purgeExpiredAuth(): Promise<{ sessions: number; reset_tokens: number }> {
+  const now = await nowISO();
+  const graceCutoff = addDays(now, -7);
+  const sessions = (await run('DELETE FROM sessions WHERE expires_at < ? OR revoked_at < ?', [now, graceCutoff])).changes;
+  const resetTokens = (await run('DELETE FROM password_reset_tokens WHERE expires_at < ? OR used_at < ?', [
+    now,
+    graceCutoff,
+  ])).changes;
+  return { sessions, reset_tokens: resetTokens };
+}
+
+export async function notifyDueFollowUps(): Promise<number> {
+  const { enabled } = await reminderConfig();
   if (!enabled) return 0;
   const today = todayStr();
-  const rows = all<{ id: number; worker_id: number; lead_id: number; scheduled_date: string; lead_number: string; customer_name: string }>(
+  const rows = await all<{ id: number; worker_id: number; lead_id: number; scheduled_date: string; lead_number: string; customer_name: string }>(
     `SELECT f.id, f.worker_id, f.lead_id, f.scheduled_date, l.lead_number, c.name AS customer_name
        FROM follow_ups f
        JOIN leads l ON l.id = f.lead_id
@@ -40,7 +55,7 @@ export function notifyDueFollowUps(): number {
   );
   let count = 0;
   for (const row of rows) {
-    notify({
+    await notify({
       userId: row.worker_id,
       type: 'FOLLOW_UP_DUE',
       title: `Follow-up due today: ${row.lead_number}`,
@@ -49,17 +64,17 @@ export function notifyDueFollowUps(): number {
       entityId: row.id,
       link: `/follow-ups?lead_id=${row.lead_id}`,
     });
-    run('UPDATE follow_ups SET reminder_sent_at = ? WHERE id = ? AND reminder_sent_at IS NULL', [nowISO(), row.id]);
+    await run('UPDATE follow_ups SET reminder_sent_at = ? WHERE id = ? AND reminder_sent_at IS NULL', [await nowISO(), row.id]);
     count += 1;
   }
   return count;
 }
 
-export function notifyOverdueFollowUps(): number {
-  const { overdue_enabled } = reminderConfig();
+export async function notifyOverdueFollowUps(): Promise<number> {
+  const { overdue_enabled } = await reminderConfig();
   if (!overdue_enabled) return 0;
   const today = todayStr();
-  const rows = all<{ id: number; worker_id: number; lead_id: number; scheduled_date: string; lead_number: string; customer_name: string }>(
+  const rows = await all<{ id: number; worker_id: number; lead_id: number; scheduled_date: string; lead_number: string; customer_name: string }>(
     `SELECT f.id, f.worker_id, f.lead_id, f.scheduled_date, l.lead_number, c.name AS customer_name
        FROM follow_ups f
        JOIN leads l ON l.id = f.lead_id
@@ -74,7 +89,7 @@ export function notifyOverdueFollowUps(): number {
   );
   let count = 0;
   for (const row of rows) {
-    notify({
+    await notify({
       userId: row.worker_id,
       type: 'FOLLOW_UP_OVERDUE',
       title: `Overdue follow-up: ${row.lead_number}`,
@@ -83,8 +98,8 @@ export function notifyOverdueFollowUps(): number {
       entityId: row.id,
       link: `/follow-ups?lead_id=${row.lead_id}`,
     });
-    run('UPDATE follow_ups SET overdue_reminder_sent_at = ? WHERE id = ? AND overdue_reminder_sent_at IS NULL', [
-      nowISO(),
+    await run('UPDATE follow_ups SET overdue_reminder_sent_at = ? WHERE id = ? AND overdue_reminder_sent_at IS NULL', [
+      await nowISO(),
       row.id,
     ]);
     count += 1;
@@ -93,25 +108,25 @@ export function notifyOverdueFollowUps(): number {
 }
 
 /** Marks quotations past their validity date as EXPIRED (idempotent). */
-export function expireQuotations(): number {
+export async function expireQuotations(): Promise<number> {
   const today = todayStr();
-  const rows = all<{ id: number; lead_id: number; quotation_number: string; created_by: number | null }>(
+  const rows = await all<{ id: number; lead_id: number; quotation_number: string; created_by: number | null }>(
     `SELECT id, lead_id, quotation_number, created_by FROM quotations
       WHERE deleted_at IS NULL AND valid_until IS NOT NULL AND valid_until < ?
         AND status IN ('SENT','VIEWED','NEGOTIATION')`,
     [today],
   );
   if (!rows.length) return 0;
-  const now = nowISO();
-  tx(() => {
+  const now = await nowISO();
+  await tx(async () => {
     for (const row of rows) {
-      const history = appendStatusHistory(row.id, 'EXPIRED', row.created_by);
-      run(`UPDATE quotations SET status = 'EXPIRED', status_history = ?, updated_at = ? WHERE id = ?`, [
+      const history = await appendStatusHistory(row.id, 'EXPIRED', row.created_by);
+      await run(`UPDATE quotations SET status = 'EXPIRED', status_history = ?, updated_at = ? WHERE id = ?`, [
         history,
         now,
         row.id,
       ]);
-      addTimelineEvent({
+      await addTimelineEvent({
         leadId: row.lead_id,
         type: TIMELINE_TYPES.QUOTATION_EXPIRED,
         actorId: row.created_by,
@@ -119,7 +134,7 @@ export function expireQuotations(): number {
         metadata: { quotation_id: row.id },
       });
       if (row.created_by) {
-        notify({
+        await notify({
           userId: row.created_by,
           type: 'QUOTATION_EXPIRED',
           title: `Quotation expired: ${row.quotation_number}`,
@@ -146,23 +161,23 @@ function pushHistoryEntry(current: string, entry: Record<string, unknown>): stri
 }
 
 /** Appends a status transition to the quotation's own status history. */
-function appendStatusHistory(quotationId: number, toStatus: string, actorId: number | null): string {
-  const row = get<{ status_history: string; status: string }>('SELECT status_history, status FROM quotations WHERE id = ?', [
+async function appendStatusHistory(quotationId: number, toStatus: string, actorId: number | null): Promise<string> {
+  const row = await get<{ status_history: string; status: string }>('SELECT status_history, status FROM quotations WHERE id = ?', [
     quotationId,
   ]);
   return pushHistoryEntry(row?.status_history ?? '[]', {
     from: row?.status,
     to: toStatus,
     actor_id: actorId,
-    at: nowISO(),
+    at: await nowISO(),
     source: 'automation',
   });
 }
 
 /** Applies configured retention rules to recordings/documents/communications. */
-export function applyRetention(): { recordings: number; documents: number; communications: number } {
-  const cfg = retentionConfig();
-  const now = nowISO();
+export async function applyRetention(): Promise<{ recordings: number; documents: number; communications: number }> {
+  const cfg = await retentionConfig();
+  const now = await nowISO();
   const today = todayStr();
   let recordings = 0;
   let documents = 0;
@@ -170,77 +185,78 @@ export function applyRetention(): { recordings: number; documents: number; commu
 
   if (cfg.call_recordings_days > 0) {
     const cutoff = addDays(today, -cfg.call_recordings_days);
-    const rows = all<{ id: number; call_id: number }>(
+    const rows = await all<{ id: number; call_id: number }>(
       'SELECT id, call_id FROM call_recordings WHERE deleted_at IS NULL AND (retention_until IS NULL OR retention_until < ?)',
       [cutoff],
     );
     for (const row of rows) {
-      run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', ['DELETED', now, now, row.id]);
-      run('UPDATE calls SET recording_available = 0, updated_at = ? WHERE id = ?', [now, row.call_id]);
+      await run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', ['DELETED', now, now, row.id]);
+      await run('UPDATE calls SET recording_available = 0, updated_at = ? WHERE id = ?', [now, row.call_id]);
       recordings += 1;
     }
-    if (recordings) auditAs(null, 'RETENTION_APPLIED', 'call_recording', null, { count: recordings, cutoff });
+    if (recordings) await auditAs(null, 'RETENTION_APPLIED', 'call_recording', null, { count: recordings, cutoff });
   }
 
   if (cfg.documents_days > 0) {
     const cutoff = addDays(today, -cfg.documents_days);
-    const rows = all<{ id: number }>('SELECT id FROM documents WHERE deleted_at IS NULL AND created_at < ?', [
+    const rows = await all<{ id: number }>('SELECT id FROM documents WHERE deleted_at IS NULL AND created_at < ?', [
       `${cutoff}T00:00:00.000Z`,
     ]);
-    for (const row of rows) run('UPDATE documents SET deleted_at = ? WHERE id = ?', [now, row.id]);
+    for (const row of rows) await run('UPDATE documents SET deleted_at = ? WHERE id = ?', [now, row.id]);
     documents = rows.length;
-    if (documents) auditAs(null, 'RETENTION_APPLIED', 'document', null, { count: documents, cutoff });
+    if (documents) await auditAs(null, 'RETENTION_APPLIED', 'document', null, { count: documents, cutoff });
   }
 
   if (cfg.communications_days > 0) {
     const cutoff = addDays(today, -cfg.communications_days);
-    const rows = all<{ id: number }>('SELECT id FROM communications WHERE deleted_at IS NULL AND created_at < ?', [
+    const rows = await all<{ id: number }>('SELECT id FROM communications WHERE deleted_at IS NULL AND created_at < ?', [
       `${cutoff}T00:00:00.000Z`,
     ]);
-    for (const row of rows) run('UPDATE communications SET deleted_at = ? WHERE id = ?', [now, row.id]);
+    for (const row of rows) await run('UPDATE communications SET deleted_at = ? WHERE id = ?', [now, row.id]);
     communications = rows.length;
-    if (communications) auditAs(null, 'RETENTION_APPLIED', 'communication', null, { count: communications, cutoff });
+    if (communications) await auditAs(null, 'RETENTION_APPLIED', 'communication', null, { count: communications, cutoff });
   }
 
   return { recordings, documents, communications };
 }
 
 /** One deterministic automation pass — called by the timer and by tests. */
-export function runAutomationOnce(): AutomationRun {
+export async function runAutomationOnce(): Promise<AutomationRun> {
   const ran: AutomationRun = {
     due_reminders: 0,
     overdue_reminders: 0,
     quotations_expired: 0,
     recordings_expired: 0,
-    ran_at: nowISO(),
+    ran_at: await nowISO(),
   };
   try {
-    ran.due_reminders = notifyDueFollowUps();
-    ran.overdue_reminders = notifyOverdueFollowUps();
-    ran.quotations_expired = expireQuotations();
-    applyRecordingRetention();
+    ran.due_reminders = await notifyDueFollowUps();
+    ran.overdue_reminders = await notifyOverdueFollowUps();
+    ran.quotations_expired = await expireQuotations();
+    await applyRecordingRetention();
+    await purgeExpiredAuth();
   } catch (err) {
     console.error('[automation] run failed', err);
   }
-  writeSetting('automation_last_run', ran);
+  await writeSetting('automation_last_run', ran);
   return ran;
 }
 
 /** Recording retention uses the per-recording retention_until (policy aware). */
-function applyRecordingRetention(): number {
-  const policyRetention = callPolicy().retention_days;
-  const now = nowISO();
-  const rows = all<{ id: number; call_id: number }>(
+async function applyRecordingRetention(): Promise<number> {
+  const policyRetention = (await callPolicy()).retention_days;
+  const now = await nowISO();
+  const rows = await all<{ id: number; call_id: number }>(
     `SELECT id, call_id FROM call_recordings
       WHERE deleted_at IS NULL AND retention_until IS NOT NULL AND retention_until < ?`,
     [now.slice(0, 10)],
   );
   if (!rows.length) return 0;
   for (const row of rows) {
-    run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', ['DELETED', now, now, row.id]);
-    run('UPDATE calls SET recording_available = 0, updated_at = ? WHERE id = ?', [now, row.call_id]);
+    await run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', ['DELETED', now, now, row.id]);
+    await run('UPDATE calls SET recording_available = 0, updated_at = ? WHERE id = ?', [now, row.call_id]);
   }
-  auditAs(null, 'RETENTION_APPLIED', 'call_recording', null, { count: rows.length, policy_days: policyRetention });
+  await auditAs(null, 'RETENTION_APPLIED', 'call_recording', null, { count: rows.length, policy_days: policyRetention });
   return rows.length;
 }
 
@@ -249,7 +265,7 @@ let timer: NodeJS.Timeout | null = null;
 /** Starts the background automation loop (never started in tests). */
 export function startScheduler(intervalMs = 60_000): void {
   if (timer || process.env.NODE_ENV === 'test') return;
-  timer = setInterval(() => runAutomationOnce(), intervalMs);
+  timer = setInterval(async () => await runAutomationOnce(), intervalMs);
   timer.unref?.();
 }
 
@@ -260,11 +276,11 @@ export function stopScheduler(): void {
   }
 }
 
-export function automationStatus(): { last_run: unknown; scheduler_enabled: boolean; reminders: unknown } {
+export async function automationStatus(): Promise<{ last_run: unknown; scheduler_enabled: boolean; reminders: unknown }> {
   return {
-    last_run: readSetting('automation_last_run', null),
+    last_run: await readSetting('automation_last_run', null),
     scheduler_enabled: Boolean(timer),
-    reminders: reminderConfig(),
+    reminders: await reminderConfig(),
   };
 }
 

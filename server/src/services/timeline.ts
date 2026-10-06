@@ -49,8 +49,8 @@ export interface TimelineInput {
   metadata?: Record<string, unknown>;
 }
 
-export function addTimelineEvent(input: TimelineInput): number {
-  const res = run(
+export async function addTimelineEvent(input: TimelineInput): Promise<number> {
+  const res = await run(
     'INSERT INTO lead_timeline (lead_id, type, actor_id, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)',
     [
       input.leadId,
@@ -58,7 +58,7 @@ export function addTimelineEvent(input: TimelineInput): number {
       input.actorId ?? null,
       input.summary,
       JSON.stringify(input.metadata ?? {}),
-      nowISO(),
+      await nowISO(),
     ],
   );
   return res.lastInsertRowid;

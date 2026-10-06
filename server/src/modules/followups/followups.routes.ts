@@ -71,8 +71,8 @@ interface FollowUpRow {
   [key: string]: any;
 }
 
-function loadFollowUp(id: number, req: any): FollowUpRow {
-  const row = get<FollowUpRow>('SELECT * FROM follow_ups WHERE id = ? AND deleted_at IS NULL', [id]);
+async function loadFollowUp(id: number, req: any): Promise<FollowUpRow> {
+  const row = await get<FollowUpRow>('SELECT * FROM follow_ups WHERE id = ? AND deleted_at IS NULL', [id]);
   if (!row) throw notFound('Follow-up not found.');
   const user = currentUser(req);
   const readAll = can(req, 'follow_ups:read_all');
@@ -87,7 +87,7 @@ function assertFollowUpWrite(row: FollowUpRow, req: any): void {
   throw forbidden('You do not have permission to update this follow-up.');
 }
 
-function buildFilters(req: any): { where: string[]; params: unknown[] } {
+async function buildFilters(req: any): Promise<{ where: string[]; params: unknown[] }> {
   const user = currentUser(req);
   const where: string[] = ['f.deleted_at IS NULL', 'l.deleted_at IS NULL'];
   const params: unknown[] = [];
@@ -103,7 +103,7 @@ function buildFilters(req: any): { where: string[]; params: unknown[] } {
       `(c.name LIKE ? ESCAPE '\\' OR c.phone LIKE ? ESCAPE '\\' OR l.lead_number LIKE ? ESCAPE '\\'
         OR l.destination LIKE ? ESCAPE '\\' OR w.name LIKE ? ESCAPE '\\')`,
     );
-    const term = likeTerm(search);
+    const term = await likeTerm(search);
     params.push(term, term, term, term, term);
   }
 
@@ -159,21 +159,21 @@ function buildFilters(req: any): { where: string[]; params: unknown[] } {
 }
 
 /** GET /api/follow-ups — paginated follow-up list (server-side filtering). */
-followUpsRouter.get('/', requireAuth, (req, res, next) => {
+followUpsRouter.get('/', requireAuth, async (req, res, next) => {
   try {
     if (!can(req, 'follow_ups:read_all') && !can(req, 'follow_ups:read_own')) throw forbidden();
     const { page, limit, offset } = pagination(req.query, 25, 200);
-    const { where, params } = buildFilters(req);
+    const { where, params } = await buildFilters(req);
     const whereSql = `WHERE ${where.join(' AND ')}`;
 
-    const total = get<{ c: number }>(
+    const total = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM follow_ups f
        JOIN leads l ON l.id = f.lead_id
        JOIN customers c ON c.id = l.customer_id
        JOIN users w ON w.id = f.worker_id
        ${whereSql}`,
       params,
-    )!.c;
+    ))!.c;
 
     const sort = String(req.query.sort ?? 'date');
     const order =
@@ -183,7 +183,7 @@ followUpsRouter.get('/', requireAuth, (req, res, next) => {
           ? 'f.status ASC, f.scheduled_date ASC'
           : 'f.scheduled_date ASC, f.scheduled_time ASC, f.id ASC';
 
-    const rows = all(`${FU_SELECT} ${whereSql} ORDER BY ${order} LIMIT ? OFFSET ?`, [...params, limit, offset]);
+    const rows = await all(`${FU_SELECT} ${whereSql} ORDER BY ${order} LIMIT ? OFFSET ?`, [...params, limit, offset]);
     list(res, rows.map(shapeFollowUp), buildMeta(page, limit, total));
   } catch (err) {
     next(err);
@@ -191,20 +191,20 @@ followUpsRouter.get('/', requireAuth, (req, res, next) => {
 });
 
 /** GET /api/follow-ups/board — Kanban columns for the follow-up board. */
-followUpsRouter.get('/board', requireAuth, (req, res, next) => {
+followUpsRouter.get('/board', requireAuth, async (req, res, next) => {
   try {
     if (!can(req, 'follow_ups:read_all') && !can(req, 'follow_ups:read_own')) throw forbidden();
-    const { where, params } = buildFilters(req);
+    const { where, params } = await buildFilters(req);
     const whereSql = `WHERE ${where.join(' AND ')}`;
     const cap = Math.min(1000, Number(req.query.limit) || 300);
 
-    const rows = all(`${FU_SELECT} ${whereSql} ORDER BY f.scheduled_date ASC, f.scheduled_time ASC LIMIT ?`, [
+    const rows = await all(`${FU_SELECT} ${whereSql} ORDER BY f.scheduled_date ASC, f.scheduled_time ASC LIMIT ?`, [
       ...params,
       cap,
     ]);
     const shaped = rows.map(shapeFollowUp);
 
-    const counts = all(
+    const counts = await all(
       `SELECT ${effectiveFuStatus('f.status', 'f.scheduled_date').sql.replace(/\?/g, `'${todayStr()}'`)} AS eff,
               COUNT(*) AS cnt
        FROM follow_ups f
@@ -234,12 +234,12 @@ followUpsRouter.get('/board', requireAuth, (req, res, next) => {
 });
 
 /** POST /api/follow-ups — schedule a follow-up for a lead. */
-followUpsRouter.post('/', requireAuth, requirePermission('follow_ups:create'), (req, res, next) => {
+followUpsRouter.post('/', requireAuth, requirePermission('follow_ups:create'), async (req, res, next) => {
   try {
     const body = meta(createSchema, req.body);
     const user = currentUser(req);
 
-    const id = createFollowUpRecord({
+    const id = await createFollowUpRecord({
       input: body,
       user,
       canCrossAssign: can(req, 'follow_ups:update'),
@@ -247,7 +247,7 @@ followUpsRouter.post('/', requireAuth, requirePermission('follow_ups:create'), (
       req,
     });
 
-    const row = get(`${FU_SELECT} WHERE f.id = ?`, [id]);
+    const row = await get(`${FU_SELECT} WHERE f.id = ?`, [id]);
     created(res, shapeFollowUp(row!));
   } catch (err) {
     next(err);
@@ -255,11 +255,11 @@ followUpsRouter.post('/', requireAuth, requirePermission('follow_ups:create'), (
 });
 
 /** GET /api/follow-ups/:id */
-followUpsRouter.get('/:id', requireAuth, (req, res, next) => {
+followUpsRouter.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    loadFollowUp(id, req);
-    const row = get(`${FU_SELECT} WHERE f.id = ?`, [id]);
+    await loadFollowUp(id, req);
+    const row = await get(`${FU_SELECT} WHERE f.id = ?`, [id]);
     if (!row) throw notFound('Follow-up not found.');
     ok(res, shapeFollowUp(row));
   } catch (err) {
@@ -268,18 +268,18 @@ followUpsRouter.get('/:id', requireAuth, (req, res, next) => {
 });
 
 /** PATCH /api/follow-ups/:id — update details, reschedule or record an outcome. */
-followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
+followUpsRouter.patch('/:id', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const existing = loadFollowUp(id, req);
+    const existing = await loadFollowUp(id, req);
     assertFollowUpWrite(existing, req);
     const body = meta(updateSchema, req.body);
     const user = currentUser(req);
-    const now = nowISO();
+    const now = await nowISO();
 
     if (body.worker_id && body.worker_id !== existing.worker_id) {
       if (!can(req, 'follow_ups:update')) throw forbidden('You cannot reassign this follow-up.');
-      const worker = get<{ id: number; status: string }>('SELECT id, status FROM users WHERE id = ? AND deleted_at IS NULL', [
+      const worker = await get<{ id: number; status: string }>('SELECT id, status FROM users WHERE id = ? AND deleted_at IS NULL', [
         body.worker_id,
       ]);
       if (!worker || worker.status !== 'ACTIVE') throw badRequest('Selected worker is not active.');
@@ -298,11 +298,11 @@ followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
     const becameTerminal = TERMINAL.includes(resolvedStatus) && !TERMINAL.includes(existing.status);
     const reopened = !TERMINAL.includes(resolvedStatus) && TERMINAL.includes(existing.status);
 
-    run(
+    await run(
       `UPDATE follow_ups SET scheduled_date = ?, scheduled_time = ?, type = ?, status = ?, notes = ?,
         customer_response = ?, next_action = ?, worker_id = ?,
-        completed_at = CASE WHEN ? THEN ? ELSE NULL END,
-        completed_by = CASE WHEN ? THEN ? ELSE NULL END,
+        completed_at = ?,
+        completed_by = ?,
         updated_at = ? WHERE id = ?`,
       [
         body.scheduled_date ?? existing.scheduled_date,
@@ -313,22 +313,20 @@ followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
         body.customer_response !== undefined ? body.customer_response : existing.customer_response,
         body.next_action !== undefined ? body.next_action : existing.next_action,
         body.worker_id ?? existing.worker_id,
-        becameTerminal ? 1 : 0,
-        now,
-        becameTerminal ? 1 : 0,
-        user.id,
+        becameTerminal ? now : null,
+        becameTerminal ? user.id : null,
         now,
         id,
       ],
     );
 
-    const lead = get<{ id: number; lead_number: string; assigned_to: number | null }>(
+    const lead = await get<{ id: number; lead_number: string; assigned_to: number | null }>(
       'SELECT id, lead_number, assigned_to FROM leads WHERE id = ?',
       [existing.lead_id],
     );
 
     if (becameTerminal) {
-      addTimelineEvent({
+      await addTimelineEvent({
         leadId: existing.lead_id,
         type: TIMELINE_TYPES.FOLLOW_UP_COMPLETED,
         actorId: user.id,
@@ -343,12 +341,12 @@ followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
 
       // Business outcomes flow back to the lead pipeline.
       if (resolvedStatus === 'CONVERTED') {
-        changeLeadStatus({ leadId: existing.lead_id, toCode: 'CONVERTED', actorId: user.id, remark: 'Follow-up converted' });
+        await changeLeadStatus({ leadId: existing.lead_id, toCode: 'CONVERTED', actorId: user.id, remark: 'Follow-up converted' });
       } else if (resolvedStatus === 'NOT_INTERESTED') {
-        changeLeadStatus({ leadId: existing.lead_id, toCode: 'NOT_INTERESTED', actorId: user.id, remark: 'Follow-up: not interested' });
+        await changeLeadStatus({ leadId: existing.lead_id, toCode: 'NOT_INTERESTED', actorId: user.id, remark: 'Follow-up: not interested' });
       }
     } else {
-      addTimelineEvent({
+      await addTimelineEvent({
         leadId: existing.lead_id,
         type: TIMELINE_TYPES.FOLLOW_UP_UPDATED,
         actorId: user.id,
@@ -357,7 +355,7 @@ followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
       });
     }
 
-    audit(req, becameTerminal ? 'FOLLOW_UP_COMPLETED' : 'FOLLOW_UP_UPDATED', 'follow_up', id, {
+    await audit(req, becameTerminal ? 'FOLLOW_UP_COMPLETED' : 'FOLLOW_UP_UPDATED', 'follow_up', id, {
       status: resolvedStatus,
       previous_status: existing.status,
       lead_id: existing.lead_id,
@@ -365,7 +363,7 @@ followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
     });
 
     if (becameTerminal && lead && lead.assigned_to && lead.assigned_to !== user.id) {
-      notify({
+      await notify({
         userId: lead.assigned_to,
         type: 'FOLLOW_UP_COMPLETED',
         title: `Follow-up ${resolvedStatus.toLowerCase()}: ${lead.lead_number}`,
@@ -376,7 +374,7 @@ followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
       });
     }
 
-    const row = get(`${FU_SELECT} WHERE f.id = ?`, [id]);
+    const row = await get(`${FU_SELECT} WHERE f.id = ?`, [id]);
     ok(res, shapeFollowUp(row!));
   } catch (err) {
     next(err);
@@ -384,27 +382,27 @@ followUpsRouter.patch('/:id', requireAuth, (req, res, next) => {
 });
 
 /** DELETE /api/follow-ups/:id — soft-cancel (history preserved). */
-followUpsRouter.delete('/:id', requireAuth, (req, res, next) => {
+followUpsRouter.delete('/:id', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const existing = loadFollowUp(id, req);
+    const existing = await loadFollowUp(id, req);
     assertFollowUpWrite(existing, req);
     const user = currentUser(req);
 
-    run('UPDATE follow_ups SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', [
+    await run('UPDATE follow_ups SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', [
       'CANCELLED',
-      nowISO(),
-      nowISO(),
+      await nowISO(),
+      await nowISO(),
       id,
     ]);
-    addTimelineEvent({
+    await addTimelineEvent({
       leadId: existing.lead_id,
       type: TIMELINE_TYPES.FOLLOW_UP_UPDATED,
       actorId: user.id,
       summary: 'Follow-up cancelled',
       metadata: { follow_up_id: id },
     });
-    audit(req, 'FOLLOW_UP_CANCELLED', 'follow_up', id, { lead_id: existing.lead_id });
+    await audit(req, 'FOLLOW_UP_CANCELLED', 'follow_up', id, { lead_id: existing.lead_id });
     ok(res, { cancelled: true });
   } catch (err) {
     next(err);

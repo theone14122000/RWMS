@@ -6,7 +6,7 @@ import { requireAuth, requirePermission } from '../../middleware/auth.js';
 
 export const auditRouter = Router();
 
-auditRouter.get('/audit-logs', requireAuth, requirePermission('audit:read'), (req, res, next) => {
+auditRouter.get('/audit-logs', requireAuth, requirePermission('audit:read'), async (req, res, next) => {
   try {
     const { page, limit, offset } = pagination(req.query, 25, 200);
     const where: string[] = ['1 = 1'];
@@ -17,7 +17,7 @@ auditRouter.get('/audit-logs', requireAuth, requirePermission('audit:read'), (re
       where.push(
         `(a.action LIKE ? ESCAPE '\\' OR a.entity LIKE ? ESCAPE '\\' OR a.entity_id LIKE ? ESCAPE '\\' OR u.name LIKE ? ESCAPE '\\')`,
       );
-      const term = likeTerm(search);
+      const term = await likeTerm(search);
       params.push(term, term, term, term);
     }
 
@@ -52,12 +52,12 @@ auditRouter.get('/audit-logs', requireAuth, requirePermission('audit:read'), (re
     }
 
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(
+    const total = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id ${whereSql}`,
       params,
-    )!.c;
+    ))!.c;
 
-    const rows = all(
+    const rows = await all(
       `SELECT a.id, a.action, a.entity, a.entity_id, a.metadata, a.ip, a.created_at,
               u.id AS user_id, u.name AS user_name
        FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id
@@ -75,9 +75,9 @@ auditRouter.get('/audit-logs', requireAuth, requirePermission('audit:read'), (re
   }
 });
 
-auditRouter.get('/audit-logs/actions', requireAuth, requirePermission('audit:read'), (_req, res, next) => {
+auditRouter.get('/audit-logs/actions', requireAuth, requirePermission('audit:read'), async (_req, res, next) => {
   try {
-    const rows = all<{ action: string; c: number }>(
+    const rows = await all<{ action: string; c: number }>(
       'SELECT action, COUNT(*) AS c FROM audit_logs GROUP BY action ORDER BY c DESC',
     );
     ok(res, rows.map((r) => ({ action: r.action, count: Number(r.c) })));

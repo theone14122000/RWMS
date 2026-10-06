@@ -82,15 +82,15 @@ export class HttpAiProvider implements AiProvider {
   }
 }
 
-export function getAiProvider(): AiProvider {
-  const cfg = aiConfig();
+export async function getAiProvider(): Promise<AiProvider> {
+  const cfg = await aiConfig();
   if (cfg.enabled && cfg.provider !== 'none' && cfg.base_url && cfg.model) {
     return new HttpAiProvider(cfg.base_url, cfg.auth_env, cfg.model, cfg.provider);
   }
   return new NullAiProvider();
 }
 
-export function aiStatus(): {
+export async function aiStatus(): Promise<{
   configured: boolean;
   provider: string;
   model: string;
@@ -98,9 +98,9 @@ export function aiStatus(): {
   auth_env: string;
   secret_present: boolean;
   reason: string | null;
-} {
-  const cfg = aiConfig();
-  const provider = getAiProvider();
+}> {
+  const cfg = await aiConfig();
+  const provider = await getAiProvider();
   const configured = provider.isConfigured();
   return {
     configured,

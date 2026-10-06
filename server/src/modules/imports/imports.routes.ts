@@ -93,7 +93,7 @@ const uploadSchema = z.object({
   content_base64: z.string().min(1).max(4_000_000),
 });
 
-importsRouter.post('/', requireAuth, requirePermission('imports:manage'), (req, res, next) => {
+importsRouter.post('/', requireAuth, requirePermission('imports:manage'), async (req, res, next) => {
   try {
     const body = meta(uploadSchema, req.body);
     const user = currentUser(req);
@@ -112,7 +112,7 @@ importsRouter.post('/', requireAuth, requirePermission('imports:manage'), (req, 
     if (columnMap.phone === undefined) throw badRequest('No "phone" column was found in the header row.');
 
     const existingPhones = new Set(
-      all<{ phone: string }>('SELECT phone FROM customers WHERE deleted_at IS NULL AND phone IS NOT NULL').map(
+      (await all<{ phone: string }>('SELECT phone FROM customers WHERE deleted_at IS NULL AND phone IS NOT NULL')).map(
         (r) => normalizePhone(r.phone),
       ),
     );
@@ -160,8 +160,8 @@ importsRouter.post('/', requireAuth, requirePermission('imports:manage'), (req, 
     const invalid = parsed.filter((r) => r.status === 'INVALID').length;
     const duplicates = parsed.filter((r) => r.status === 'DUPLICATE').length;
 
-    const now = nowISO();
-    const jobId = run(
+    const now = await nowISO();
+    const jobId = (await run(
       `INSERT INTO import_jobs (kind, filename, status, column_map, preview, total_rows, valid_rows, invalid_rows,
         duplicate_rows, imported_rows, failed_rows, errors, created_by, created_at, updated_at)
        VALUES ('LEADS', ?, 'PARSED', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)`,
@@ -178,9 +178,9 @@ importsRouter.post('/', requireAuth, requirePermission('imports:manage'), (req, 
         now,
         now,
       ],
-    ).lastInsertRowid;
+    )).lastInsertRowid;
 
-    audit(req, 'IMPORT_PARSED', 'import_job', jobId, {
+    await audit(req, 'IMPORT_PARSED', 'import_job', jobId, {
       filename: body.filename,
       total,
       valid,
@@ -188,7 +188,7 @@ importsRouter.post('/', requireAuth, requirePermission('imports:manage'), (req, 
       duplicates,
     });
 
-    const row = get('SELECT * FROM import_jobs WHERE id = ?', [jobId]);
+    const row = await get('SELECT * FROM import_jobs WHERE id = ?', [jobId]);
     created(res, jobShape(row!));
   } catch (err) {
     next(err);
@@ -197,7 +197,7 @@ importsRouter.post('/', requireAuth, requirePermission('imports:manage'), (req, 
 
 /* -------------------------------- LIST -------------------------------- */
 
-importsRouter.get('/', requireAuth, requirePermission('imports:manage'), (req, res, next) => {
+importsRouter.get('/', requireAuth, requirePermission('imports:manage'), async (req, res, next) => {
   try {
     const where: string[] = ['deleted_at IS NULL'];
     const params: unknown[] = [];
@@ -213,12 +213,12 @@ importsRouter.get('/', requireAuth, requirePermission('imports:manage'), (req, r
     const search = String(req.query.search ?? '').trim();
     if (search) {
       where.push('filename LIKE ? ESCAPE \'\\\'');
-      params.push(likeTerm(search));
+      params.push(await likeTerm(search));
     }
     const { page, limit, offset } = pagination(req.query, 20, 100);
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(`SELECT COUNT(*) AS c FROM import_jobs ${whereSql}`, params)!.c;
-    const rows = all(`SELECT * FROM import_jobs ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`, [
+    const total = (await get<{ c: number }>(`SELECT COUNT(*) AS c FROM import_jobs ${whereSql}`, params))!.c;
+    const rows = await all(`SELECT * FROM import_jobs ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`, [
       ...params,
       limit,
       offset,
@@ -231,10 +231,10 @@ importsRouter.get('/', requireAuth, requirePermission('imports:manage'), (req, r
 
 /* ------------------------------- DETAIL ------------------------------ */
 
-importsRouter.get('/:id(\\d+)', requireAuth, requirePermission('imports:manage'), (req, res, next) => {
+importsRouter.get('/:id(\\d+)', requireAuth, requirePermission('imports:manage'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const row = get('SELECT * FROM import_jobs WHERE id = ? AND deleted_at IS NULL', [id]);
+    const row = await get('SELECT * FROM import_jobs WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!row) throw notFound('Import job not found.');
     ok(res, jobShape(row));
   } catch (err) {
@@ -250,30 +250,30 @@ const runSchema = z.object({
   worker_id: z.number().int().positive().optional(),
 });
 
-function resolveSourceId(name: string | undefined): number | null {
+async function resolveSourceId(name: string | undefined): Promise<number | null> {
   if (!name) return null;
-  const existing = get<{ id: number }>('SELECT id FROM lead_sources WHERE name = ? COLLATE NOCASE', [name]);
+  const existing = await get<{ id: number }>('SELECT id FROM lead_sources WHERE lower(name) = lower(?)', [name]);
   if (existing) return existing.id;
-  const now = nowISO();
-  return run('INSERT INTO lead_sources (name, sort_order, created_at, updated_at) VALUES (?, 999, ?, ?)', [
+  const now = await nowISO();
+  return (await run('INSERT INTO lead_sources (name, sort_order, created_at, updated_at) VALUES (?, 999, ?, ?)', [
     name,
     now,
     now,
-  ]).lastInsertRowid;
+  ])).lastInsertRowid;
 }
 
-function defaultStatusId(): number {
-  const preferred = get<{ id: number }>(`SELECT id FROM lead_statuses WHERE code = 'NEW' AND is_active = 1`);
+async function defaultStatusId(): Promise<number> {
+  const preferred = await get<{ id: number }>(`SELECT id FROM lead_statuses WHERE code = 'NEW' AND is_active = 1`);
   if (preferred) return preferred.id;
-  const first = get<{ id: number }>('SELECT id FROM lead_statuses WHERE is_active = 1 ORDER BY sort_order, id LIMIT 1');
+  const first = await get<{ id: number }>('SELECT id FROM lead_statuses WHERE is_active = 1 ORDER BY sort_order, id LIMIT 1');
   if (!first) throw badRequest('No active lead status is configured.');
   return first.id;
 }
 
-importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:manage'), (req, res, next) => {
+importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:manage'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const job = get<any>('SELECT * FROM import_jobs WHERE id = ? AND deleted_at IS NULL', [id]);
+    const job = await get<any>('SELECT * FROM import_jobs WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!job) throw notFound('Import job not found.');
     if (job.status === 'COMPLETED') throw conflict('This import has already been run.');
     if (job.status !== 'PARSED') throw conflict(`An import in status ${job.status} cannot be run.`);
@@ -282,7 +282,7 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
     const user = currentUser(req);
     if (body.assign === 'MANUAL') {
       if (!body.worker_id) throw badRequest('worker_id is required when assign is MANUAL.');
-      const worker = get<{ status: string }>('SELECT status FROM users WHERE id = ? AND deleted_at IS NULL', [
+      const worker = await get<{ status: string }>('SELECT status FROM users WHERE id = ? AND deleted_at IS NULL', [
         body.worker_id,
       ]);
       if (!worker) throw badRequest('Selected worker does not exist.');
@@ -290,15 +290,15 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
     }
 
     const rows: ParsedRow[] = JSON.parse(job.preview ?? '[]');
-    const now = nowISO();
-    run('UPDATE import_jobs SET status = ?, updated_at = ? WHERE id = ?', ['IMPORTING', now, id]);
+    const now = await nowISO();
+    await run('UPDATE import_jobs SET status = ?, updated_at = ? WHERE id = ?', ['IMPORTING', now, id]);
 
-    const cfg = assignmentConfig();
+    const cfg = await assignmentConfig();
     let imported = 0;
     let failed = 0;
     const runErrors: Array<{ row: number; message: string }> = JSON.parse(job.errors ?? '[]');
     const phoneIndex = new Map<string, number>();
-    for (const r of all<{ id: number; phone: string | null }>(
+    for (const r of await all<{ id: number; phone: string | null }>(
       'SELECT id, phone FROM customers WHERE deleted_at IS NULL',
     )) {
       const key = normalizePhone(r.phone ?? '');
@@ -315,13 +315,13 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
       const values = parsedRow.values;
       const phoneDigits = normalizePhone(values.phone ?? '');
       try {
-        tx(() => {
+        await tx(async () => {
           let customerId: number;
           const existingCustomerId = phoneIndex.get(phoneDigits);
           if (existingCustomerId) {
             customerId = existingCustomerId;
           } else {
-            customerId = run(
+            customerId = (await run(
               `INSERT INTO customers (name, phone, whatsapp, email, city, created_by, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
               [
@@ -334,9 +334,9 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
                 now,
                 now,
               ],
-            ).lastInsertRowid;
+            )).lastInsertRowid;
             phoneIndex.set(phoneDigits, customerId);
-            audit(req, 'CUSTOMER_CREATED', 'customer', customerId, { via: 'import', job_id: id });
+            await audit(req, 'CUSTOMER_CREATED', 'customer', customerId, { via: 'import', job_id: id });
           }
 
           const priority = PRIORITY_VALUES.includes(String(values.priority).toUpperCase())
@@ -346,15 +346,15 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
             ? String(values.trip_type).toUpperCase()
             : null;
 
-          const leadId = run(
+          const leadId = (await run(
             `INSERT INTO leads (lead_number, customer_id, source_id, assigned_to, destination, travel_type, trip_type,
               requirements, travel_start_date, travel_end_date, budget, priority, status_id, notes, custom_fields,
               import_job_id, created_by, updated_by, created_at, updated_at)
              VALUES (?, ?, ?, NULL, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?)`,
             [
-              nextLeadNumber(),
+              await nextLeadNumber(),
               customerId,
-              resolveSourceId(values.source),
+              await resolveSourceId(values.source),
               values.destination || null,
               travelType,
               null,
@@ -362,7 +362,7 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
               values.travel_end || null,
               values.budget ? Number(String(values.budget).replace(/[^\d.]/g, '')) || null : null,
               priority,
-              defaultStatusId(),
+              await defaultStatusId(),
               values.notes || null,
               id,
               user.id,
@@ -370,9 +370,9 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
               now,
               now,
             ],
-          ).lastInsertRowid;
+          )).lastInsertRowid;
 
-          addTimelineEvent({
+          await addTimelineEvent({
             leadId,
             type: TIMELINE_TYPES.LEAD_IMPORTED,
             actorId: user.id,
@@ -381,17 +381,17 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
           });
 
           if (body.assign === 'MANUAL' && body.worker_id) {
-            const lead = get<LeadRow>('SELECT * FROM leads WHERE id = ?', [leadId])!;
-            autoAssignLead({ lead, actorId: user.id, actorName: user.name, strategy: 'MANUAL' });
-            run('UPDATE leads SET assigned_to = ?, updated_at = ? WHERE id = ?', [body.worker_id, now, leadId]);
-            run(
+            const lead = (await get<LeadRow>('SELECT * FROM leads WHERE id = ?', [leadId]))!;
+            await autoAssignLead({ lead, actorId: user.id, actorName: user.name, strategy: 'MANUAL' });
+            await run('UPDATE leads SET assigned_to = ?, updated_at = ? WHERE id = ?', [body.worker_id, now, leadId]);
+            await run(
               `INSERT INTO lead_assignments (lead_id, assigned_to, assigned_by, action, reason, assigned_at)
                VALUES (?, ?, ?, 'ASSIGNED', 'import:manual', ?)`,
               [leadId, body.worker_id, user.id, now],
             );
           } else if (body.assign === 'AUTO' && cfg.auto_assign_new) {
-            const lead = get<LeadRow>('SELECT * FROM leads WHERE id = ?', [leadId])!;
-            autoAssignLead({ lead, actorId: user.id, actorName: user.name });
+            const lead = (await get<LeadRow>('SELECT * FROM leads WHERE id = ?', [leadId]))!;
+            await autoAssignLead({ lead, actorId: user.id, actorName: user.name });
           }
 
           imported += 1;
@@ -407,15 +407,15 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
       }
     }
 
-    run(
+    await run(
       `UPDATE import_jobs SET status = 'COMPLETED', imported_rows = ?, failed_rows = ?, errors = ?, updated_at = ?,
          completed_at = ? WHERE id = ?`,
-      [imported, failed, JSON.stringify(runErrors), nowISO(), nowISO(), id],
+      [imported, failed, JSON.stringify(runErrors), await nowISO(), await nowISO(), id],
     );
 
-    audit(req, 'IMPORT_COMPLETED', 'import_job', id, { imported, failed, filename: job.filename });
+    await audit(req, 'IMPORT_COMPLETED', 'import_job', id, { imported, failed, filename: job.filename });
 
-    const row = get('SELECT * FROM import_jobs WHERE id = ?', [id]);
+    const row = await get('SELECT * FROM import_jobs WHERE id = ?', [id]);
     ok(res, { ...jobShape(row!), imported_rows: imported, failed_rows: failed, error_count: runErrors.length });
   } catch (err) {
     next(err);
@@ -424,13 +424,13 @@ importsRouter.post('/:id(\\d+)/run', requireAuth, requirePermission('imports:man
 
 /* ------------------------------- DELETE ------------------------------ */
 
-importsRouter.delete('/:id(\\d+)', requireAuth, requirePermission('imports:manage'), (req, res, next) => {
+importsRouter.delete('/:id(\\d+)', requireAuth, requirePermission('imports:manage'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const job = get<{ id: number }>('SELECT id FROM import_jobs WHERE id = ? AND deleted_at IS NULL', [id]);
+    const job = await get<{ id: number }>('SELECT id FROM import_jobs WHERE id = ? AND deleted_at IS NULL', [id]);
     if (!job) throw notFound('Import job not found.');
-    run('UPDATE import_jobs SET deleted_at = ?, updated_at = ? WHERE id = ?', [nowISO(), nowISO(), id]);
-    audit(req, 'IMPORT_DELETED', 'import_job', id, {});
+    await run('UPDATE import_jobs SET deleted_at = ?, updated_at = ? WHERE id = ?', [await nowISO(), await nowISO(), id]);
+    await audit(req, 'IMPORT_DELETED', 'import_job', id, {});
     ok(res, { deleted: true });
   } catch (err) {
     next(err);

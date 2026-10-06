@@ -75,12 +75,12 @@ interface CallRow {
 }
 
 /** Permission-free row load — used by webhooks and by loadCall. */
-export function getCallRow(id: number): CallRow | undefined {
-  return get<CallRow>('SELECT * FROM calls WHERE id = ? AND deleted_at IS NULL', [id]);
+export async function getCallRow(id: number): Promise<CallRow | undefined> {
+  return await get<CallRow>('SELECT * FROM calls WHERE id = ? AND deleted_at IS NULL', [id]);
 }
 
-function loadCall(id: number, req: any): CallRow {
-  const row = getCallRow(id);
+async function loadCall(id: number, req: any): Promise<CallRow> {
+  const row = await getCallRow(id);
   if (!row) throw notFound('Call not found.');
   const user = req.user;
   if (!user) throw forbidden();
@@ -99,21 +99,21 @@ function assertCallWriteAccess(call: CallRow, req: any): void {
 }
 
 /** Resolves/validates the lead + customer a call belongs to. */
-function resolveTargets(req: any, body: { lead_id?: number | null; customer_id?: number | null }): {
+async function resolveTargets(req: any, body: { lead_id?: number | null; customer_id?: number | null }): Promise<{
   leadId: number | null;
   customerId: number | null;
-} {
+}> {
   let leadId = body.lead_id ?? null;
   let customerId = body.customer_id ?? null;
 
   if (leadId) {
-    const lead = loadLead(leadId, req);
+    const lead = await loadLead(leadId, req);
     if (!customerId) customerId = lead.customer_id;
   } else if (customerId) {
-    const customer = get<{ id: number }>('SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL', [customerId]);
+    const customer = await get<{ id: number }>('SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL', [customerId]);
     if (!customer) throw notFound('Customer not found.');
     if (!can(req, 'leads:read_all')) {
-      const owned = get<{ c: number }>(
+      const owned = await get<{ c: number }>(
         'SELECT COUNT(*) AS c FROM leads WHERE customer_id = ? AND assigned_to = ? AND deleted_at IS NULL',
         [customerId, currentUser(req).id],
       );
@@ -123,17 +123,17 @@ function resolveTargets(req: any, body: { lead_id?: number | null; customer_id?:
   return { leadId, customerId };
 }
 
-function phoneForTargets(leadId: number | null, customerId: number | null, explicit?: string | null): string | null {
+async function phoneForTargets(leadId: number | null, customerId: number | null, explicit?: string | null): Promise<string | null> {
   if (explicit) return explicit;
   if (leadId) {
-    const row = get<{ phone: string | null }>(
+    const row = await get<{ phone: string | null }>(
       'SELECT c.phone FROM leads l JOIN customers c ON c.id = l.customer_id WHERE l.id = ?',
       [leadId],
     );
     if (row?.phone) return row.phone;
   }
   if (customerId) {
-    const row = get<{ phone: string | null }>('SELECT phone FROM customers WHERE id = ?', [customerId]);
+    const row = await get<{ phone: string | null }>('SELECT phone FROM customers WHERE id = ?', [customerId]);
     if (row?.phone) return row.phone;
   }
   return null;
@@ -141,7 +141,7 @@ function phoneForTargets(leadId: number | null, customerId: number | null, expli
 
 /* ------------------------------- LIST ------------------------------- */
 
-callsRouter.get('/', requireAuth, (req, res, next) => {
+callsRouter.get('/', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     const where: string[] = ['cl.deleted_at IS NULL'];
@@ -183,7 +183,7 @@ callsRouter.get('/', requireAuth, (req, res, next) => {
         `(cl.phone_number LIKE ? ESCAPE '\\' OR cl.notes LIKE ? ESCAPE '\\' OR l.lead_number LIKE ? ESCAPE '\\'
           OR c.name LIKE ? ESCAPE '\\' OR w.name LIKE ? ESCAPE '\\')`,
       );
-      const term = likeTerm(search);
+      const term = await likeTerm(search);
       params.push(term, term, term, term, term);
     }
     const dates = resolvePeriodDates(
@@ -209,11 +209,11 @@ callsRouter.get('/', requireAuth, (req, res, next) => {
 
     const { page, limit, offset } = pagination(req.query, 20, 100);
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(`SELECT COUNT(*) AS c FROM calls cl
+    const total = (await get<{ c: number }>(`SELECT COUNT(*) AS c FROM calls cl
       LEFT JOIN leads l ON l.id = cl.lead_id
       LEFT JOIN customers c ON c.id = cl.customer_id
-      LEFT JOIN users w ON w.id = cl.worker_id ${whereSql}`, params)!.c;
-    const rows = all(`${CALL_SELECT} ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`, [...params, limit, offset]);
+      LEFT JOIN users w ON w.id = cl.worker_id ${whereSql}`, params))!.c;
+    const rows = await all(`${CALL_SELECT} ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`, [...params, limit, offset]);
 
     list(res, rows.map(shapeCall), buildMeta(page, limit, total));
   } catch (err) {
@@ -240,35 +240,35 @@ const createCallSchema = z.object({
   provider_call_id: z.string().trim().max(120).optional().nullable(),
 });
 
-callsRouter.post('/', requireAuth, requirePermission('calls:create'), (req, res, next) => {
+callsRouter.post('/', requireAuth, requirePermission('calls:create'), async (req, res, next) => {
   try {
     const body = meta(createCallSchema, req.body);
     const user = currentUser(req);
-    const { leadId, customerId } = resolveTargets(req, body);
+    const { leadId, customerId } = await resolveTargets(req, body);
 
     let workerId = user.id;
     if (body.worker_id && body.worker_id !== user.id) {
       if (!can(req, 'calls:read_all')) throw forbidden('You cannot log calls for another worker.');
-      const target = get<{ status: string }>('SELECT status FROM users WHERE id = ? AND deleted_at IS NULL', [body.worker_id]);
+      const target = await get<{ status: string }>('SELECT status FROM users WHERE id = ? AND deleted_at IS NULL', [body.worker_id]);
       if (!target) throw badRequest('Selected worker does not exist.');
       if (target.status !== 'ACTIVE') throw badRequest('Selected worker is not active.');
       workerId = body.worker_id;
     }
 
-    const policy = callPolicy();
-    const now = nowISO();
+    const policy = await callPolicy();
+    const now = await nowISO();
     const startedAt = body.started_at ?? (body.status === 'RINGING' ? null : now);
     const provider = body.provider ?? 'manual';
 
     if (body.provider_call_id) {
-      const clash = get<{ id: number }>('SELECT id FROM calls WHERE provider = ? AND provider_call_id = ?', [
+      const clash = await get<{ id: number }>('SELECT id FROM calls WHERE provider = ? AND provider_call_id = ?', [
         provider,
         body.provider_call_id,
       ]);
       if (clash) throw conflict('A call with this provider reference already exists.', { existing_id: clash.id });
     }
 
-    const id = run(
+    const id = (await run(
       `INSERT INTO calls (lead_id, customer_id, worker_id, provider, provider_call_id, direction, phone_number,
         started_at, answered_at, ended_at, duration_seconds, status, disposition, notes, consent, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -279,7 +279,7 @@ callsRouter.post('/', requireAuth, requirePermission('calls:create'), (req, res,
         provider,
         body.provider_call_id ?? null,
         body.direction,
-        phoneForTargets(leadId, customerId, body.phone_number),
+        await phoneForTargets(leadId, customerId, body.phone_number),
         startedAt,
         body.answered_at ?? null,
         body.ended_at ?? null,
@@ -296,11 +296,11 @@ callsRouter.post('/', requireAuth, requirePermission('calls:create'), (req, res,
         now,
         now,
       ],
-    ).lastInsertRowid;
+    )).lastInsertRowid;
 
-    finalizeCallCreation({ id, leadId, status: body.status, req, actorName: user.name });
+    await finalizeCallCreation({ id, leadId, status: body.status, req, actorName: user.name });
 
-    const row = get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
+    const row = await get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
     created(res, shapeCall(row!));
   } catch (err) {
     next(err);
@@ -308,14 +308,14 @@ callsRouter.post('/', requireAuth, requirePermission('calls:create'), (req, res,
 });
 
 /** Shared side effects for both manual creation and webhook-created calls. */
-export function finalizeCallCreation(opts: {
+export async function finalizeCallCreation(opts: {
   id: number;
   leadId: number | null;
   status: string;
   req?: any;
   actorName?: string;
   actorId?: number;
-}): void {
+}): Promise<void> {
   const { id, leadId, status } = opts;
   const type =
     status === 'MISSED' || status === 'NO_ANSWER'
@@ -325,7 +325,7 @@ export function finalizeCallCreation(opts: {
         : TIMELINE_TYPES.CALL_LOGGED;
 
   if (leadId) {
-    addTimelineEvent({
+    await addTimelineEvent({
       leadId,
       type,
       actorId: opts.actorId ?? opts.req?.user?.id ?? null,
@@ -339,20 +339,20 @@ export function finalizeCallCreation(opts: {
     });
 
     if (status === 'COMPLETED' || status === 'ANSWERED') {
-      run('UPDATE leads SET last_contacted_at = ?, updated_at = ? WHERE id = ?', [nowISO(), nowISO(), leadId]);
+      await run('UPDATE leads SET last_contacted_at = ?, updated_at = ? WHERE id = ?', [await nowISO(), await nowISO(), leadId]);
     }
   }
 
-  audit(opts.req, 'CALL_CREATED', 'call', id, { status, lead_id: leadId });
+  await audit(opts.req, 'CALL_CREATED', 'call', id, { status, lead_id: leadId });
 
   // Missed inbound calls are worth notifying the owner about.
   if (status === 'MISSED' && leadId) {
-    const lead = get<{ assigned_to: number | null; lead_number: string }>(
+    const lead = await get<{ assigned_to: number | null; lead_number: string }>(
       'SELECT assigned_to, lead_number FROM leads WHERE id = ?',
       [leadId],
     );
     if (lead?.assigned_to) {
-      notify({
+      await notify({
         userId: lead.assigned_to,
         type: 'CALL_MISSED',
         title: `Missed call: ${lead.lead_number}`,
@@ -367,11 +367,11 @@ export function finalizeCallCreation(opts: {
 
 /* ------------------------------ DETAIL ------------------------------ */
 
-callsRouter.get('/:id(\\d+)', requireAuth, (req, res, next) => {
+callsRouter.get('/:id(\\d+)', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    loadCall(id, req);
-    const row = get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
+    await loadCall(id, req);
+    const row = await get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
     if (!row) throw notFound('Call not found.');
     ok(res, shapeCall(row));
   } catch (err) {
@@ -390,10 +390,10 @@ const patchCallSchema = z
   })
   .partial();
 
-callsRouter.patch('/:id(\\d+)', requireAuth, (req, res, next) => {
+callsRouter.patch('/:id(\\d+)', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const call = loadCall(id, req);
+    const call = await loadCall(id, req);
     assertCallWriteAccess(call, req);
     const body = meta(patchCallSchema, req.body);
 
@@ -407,11 +407,11 @@ callsRouter.patch('/:id(\\d+)', requireAuth, (req, res, next) => {
     }
     if (!fields.length) throw badRequest('No changes supplied.');
     fields.push('updated_at = ?');
-    params.push(nowISO(), id);
-    run(`UPDATE calls SET ${fields.join(', ')} WHERE id = ?`, params);
+    params.push(await nowISO(), id);
+    await run(`UPDATE calls SET ${fields.join(', ')} WHERE id = ?`, params);
 
-    audit(req, 'CALL_UPDATED', 'call', id, { ...body });
-    const row = get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
+    await audit(req, 'CALL_UPDATED', 'call', id, { ...body });
+    const row = await get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
     ok(res, shapeCall(row!));
   } catch (err) {
     next(err);
@@ -441,10 +441,10 @@ const nextActionSchema = z.object({
  * The fast post-call workflow: outcome → response → next action → follow-up.
  * Workers run this dozens of times a day, so it is one request.
  */
-callsRouter.post('/:id(\\d+)/next-action', requireAuth, requirePermission('calls:create'), (req, res, next) => {
+callsRouter.post('/:id(\\d+)/next-action', requireAuth, requirePermission('calls:create'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const call = loadCall(id, req);
+    const call = await loadCall(id, req);
     assertCallWriteAccess(call, req);
     const body = meta(nextActionSchema, req.body);
     const user = currentUser(req);
@@ -459,42 +459,42 @@ callsRouter.post('/:id(\\d+)/next-action', requireAuth, requirePermission('calls
         .filter(Boolean)
         .join('\n');
       const existing = call.notes ? `${call.notes}\n` : '';
-      run('UPDATE calls SET disposition = COALESCE(?, disposition), notes = ?, updated_at = ? WHERE id = ?', [
+      await run('UPDATE calls SET disposition = COALESCE(?, disposition), notes = ?, updated_at = ? WHERE id = ?', [
         body.disposition ?? null,
         notes ? `${existing}${notes}` : call.notes,
-        nowISO(),
+        await nowISO(),
         id,
       ]);
       result.disposition = body.disposition ?? call.disposition;
     }
 
     if (body.add_note && leadId) {
-      const noteId = run('INSERT INTO notes (lead_id, author_id, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
+      const noteId = (await run('INSERT INTO notes (lead_id, author_id, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
         leadId,
         user.id,
         body.add_note,
-        nowISO(),
-        nowISO(),
-      ]).lastInsertRowid;
-      addTimelineEvent({
+        await nowISO(),
+        await nowISO(),
+      ])).lastInsertRowid;
+      await addTimelineEvent({
         leadId,
         type: TIMELINE_TYPES.NOTE_ADDED,
         actorId: user.id,
         summary: 'Note added after call',
         metadata: { note_id: noteId, call_id: id },
       });
-      audit(req, 'NOTE_ADDED', 'note', noteId, { lead_id: leadId, call_id: id });
+      await audit(req, 'NOTE_ADDED', 'note', noteId, { lead_id: leadId, call_id: id });
       result.note_id = noteId;
     }
 
     if (body.lead_status && leadId) {
-      const change = changeLeadStatus({ leadId, toCode: body.lead_status, actorId: user.id, remark: body.customer_response ?? 'Call outcome' });
-      if (change) audit(req, 'LEAD_STATUS_CHANGED', 'lead', leadId, { from: change.from, to: change.to, call_id: id });
+      const change = await changeLeadStatus({ leadId, toCode: body.lead_status, actorId: user.id, remark: body.customer_response ?? 'Call outcome' });
+      if (change) await audit(req, 'LEAD_STATUS_CHANGED', 'lead', leadId, { from: change.from, to: change.to, call_id: id });
       result.lead_status = change ? change.to : body.lead_status;
     }
 
     if (body.follow_up && leadId) {
-      const fuId = createFollowUpRecord({
+      const fuId = await createFollowUpRecord({
         input: {
           lead_id: leadId,
           worker_id: call.worker_id,
@@ -510,17 +510,17 @@ callsRouter.post('/:id(\\d+)/next-action', requireAuth, requirePermission('calls
         canScheduleOnAnyLead: can(req, 'leads:read_all'),
         req,
       });
-      run('UPDATE calls SET follow_up_id = ?, updated_at = ? WHERE id = ?', [fuId, nowISO(), id]);
+      await run('UPDATE calls SET follow_up_id = ?, updated_at = ? WHERE id = ?', [fuId, await nowISO(), id]);
       result.follow_up_id = fuId;
     }
 
-    audit(req, 'CALL_NEXT_ACTION', 'call', id, {
+    await audit(req, 'CALL_NEXT_ACTION', 'call', id, {
       disposition: body.disposition ?? null,
       has_follow_up: Boolean(body.follow_up),
       lead_status: body.lead_status ?? null,
     });
 
-    const row = get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
+    const row = await get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
     ok(res, { call: shapeCall(row!), ...result });
   } catch (err) {
     next(err);
@@ -541,11 +541,11 @@ callsRouter.post('/initiate', requireAuth, requirePermission('calls:create'), as
       req.body,
     );
     const user = currentUser(req);
-    const { leadId, customerId } = resolveTargets(req, body);
-    const phone = phoneForTargets(leadId, customerId, body.phone_number);
+    const { leadId, customerId } = await resolveTargets(req, body);
+    const phone = await phoneForTargets(leadId, customerId, body.phone_number);
     if (!phone) throw badRequest('No phone number available for this lead or customer.');
 
-    const provider = getTelephonyProvider();
+    const provider = await getTelephonyProvider();
     const result = await provider.initiateCall({
       toNumber: phone,
       workerId: user.id,
@@ -553,9 +553,9 @@ callsRouter.post('/initiate', requireAuth, requirePermission('calls:create'), as
       customerId,
     });
 
-    const policy = callPolicy();
-    const now = nowISO();
-    const id = run(
+    const policy = await callPolicy();
+    const now = await nowISO();
+    const id = (await run(
       `INSERT INTO calls (lead_id, customer_id, worker_id, provider, provider_call_id, direction, phone_number,
         started_at, status, consent, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'OUTBOUND', ?, ?, 'RINGING', ?, ?, ?, ?)`,
@@ -572,12 +572,12 @@ callsRouter.post('/initiate', requireAuth, requirePermission('calls:create'), as
         now,
         now,
       ],
-    ).lastInsertRowid;
+    )).lastInsertRowid;
 
-    finalizeCallCreation({ id, leadId, status: 'RINGING', req, actorName: user.name });
-    audit(req, 'CALL_INITIATED', 'call', id, { provider: result.provider, provider_call_id: result.providerCallId });
+    await finalizeCallCreation({ id, leadId, status: 'RINGING', req, actorName: user.name });
+    await audit(req, 'CALL_INITIATED', 'call', id, { provider: result.provider, provider_call_id: result.providerCallId });
 
-    const row = get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
+    const row = await get(`${CALL_SELECT} WHERE cl.id = ?`, [id]);
     created(res, shapeCall(row!));
   } catch (err) {
     next(err);
@@ -586,18 +586,18 @@ callsRouter.post('/initiate', requireAuth, requirePermission('calls:create'), as
 
 /* ---------------------------- RECORDINGS ---------------------------- */
 
-export function loadRecording(callId: number) {
-  return get<any>(
+export async function loadRecording(callId: number) {
+  return await get<any>(
     'SELECT * FROM call_recordings WHERE call_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1',
     [callId],
   );
 }
 
-callsRouter.get('/:id(\\d+)/recording', requireAuth, (req, res, next) => {
+callsRouter.get('/:id(\\d+)/recording', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    loadCall(id, req);
-    const rec = loadRecording(id);
+    await loadCall(id, req);
+    const rec = await loadRecording(id);
     if (!rec) {
       ok(res, { available: false, reason: 'No recording is attached to this call.' });
       return;
@@ -620,23 +620,23 @@ callsRouter.get('/:id(\\d+)/recording', requireAuth, (req, res, next) => {
 callsRouter.get('/:id(\\d+)/recording/stream', requireAuth, requirePermission('recordings:access'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const call = loadCall(id, req);
-    const rec = loadRecording(id);
+    const call = await loadCall(id, req);
+    const rec = await loadRecording(id);
     if (!rec || rec.status !== 'AVAILABLE') throw notFound('Recording is not available.');
     if (rec.retention_until && rec.retention_until < todayStr()) {
-      run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', [
+      await run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', [
         'DELETED',
-        nowISO(),
-        nowISO(),
+        await nowISO(),
+        await nowISO(),
         rec.id,
       ]);
       throw notFound('This recording has passed the retention period.');
     }
 
-    audit(req, 'RECORDING_ACCESSED', 'call_recording', rec.id, { call_id: call.id, storage: rec.storage });
+    await audit(req, 'RECORDING_ACCESSED', 'call_recording', rec.id, { call_id: call.id, storage: rec.storage });
 
     if (rec.storage === 'provider') {
-      const provider = getTelephonyProvider();
+      const provider = await getTelephonyProvider();
       const ticket = await provider.fetchRecordingUrl(String(rec.provider_recording_id ?? rec.id));
       if (!ticket) throw notFound('The provider no longer has this recording.');
       const upstreamRes = await fetch(ticket.url, { signal: AbortSignal.timeout(20_000) });
@@ -673,7 +673,7 @@ const attachRecordingSchema = z.object({
 });
 
 /** Upserts the recording row and runs the shared side effects. */
-export function attachRecordingToCall(opts: {
+export async function attachRecordingToCall(opts: {
   call: CallRow;
   req: any;
   actorId: number | null;
@@ -683,20 +683,20 @@ export function attachRecordingToCall(opts: {
   providerRecordingId?: string | null;
   sourceUrl?: string | null;
   durationSeconds?: number | null;
-}): { id: number } {
+}): Promise<{ id: number }> {
   const { call, req } = opts;
   const id = call.id;
-  const now = nowISO();
-  const existing = loadRecording(id);
+  const now = await nowISO();
+  const existing = await loadRecording(id);
   if (existing && existing.status === 'AVAILABLE') throw conflict('A recording is already attached to this call.');
 
-  const retentionDays = retentionConfig().call_recordings_days || callPolicy().retention_days;
+  const retentionDays = (await retentionConfig()).call_recordings_days || (await callPolicy()).retention_days;
   const retentionUntil = retentionDays > 0 ? new Date(Date.now() + retentionDays * 86400_000).toISOString().slice(0, 10) : null;
 
   let recId: number;
   if (existing) {
     recId = existing.id;
-    run(
+    await run(
       `UPDATE call_recordings SET status = 'AVAILABLE', storage = ?, provider_recording_id = ?, source_url = ?,
          file_key = ?, mime_type = ?, duration_seconds = ?, retention_until = ?, updated_at = ?, deleted_at = NULL
        WHERE id = ?`,
@@ -713,7 +713,7 @@ export function attachRecordingToCall(opts: {
       ],
     );
   } else {
-    recId = run(
+    recId = (await run(
       `INSERT INTO call_recordings (call_id, provider, provider_recording_id, storage, source_url, file_key,
          mime_type, duration_seconds, status, consent, retention_until, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'AVAILABLE', ?, ?, ?, ?)`,
@@ -731,12 +731,12 @@ export function attachRecordingToCall(opts: {
         now,
         now,
       ],
-    ).lastInsertRowid;
+    )).lastInsertRowid;
   }
 
-  run('UPDATE calls SET recording_available = 1, updated_at = ? WHERE id = ?', [now, id]);
+  await run('UPDATE calls SET recording_available = 1, updated_at = ? WHERE id = ?', [now, id]);
   if (call.lead_id) {
-    addTimelineEvent({
+    await addTimelineEvent({
       leadId: call.lead_id,
       type: TIMELINE_TYPES.RECORDING_READY,
       actorId: opts.actorId,
@@ -744,7 +744,7 @@ export function attachRecordingToCall(opts: {
       metadata: { call_id: id, recording_id: recId },
     });
   }
-  notify({
+  await notify({
     userId: call.worker_id,
     type: 'CALL_RECORDING_READY',
     title: 'Call recording ready',
@@ -753,14 +753,14 @@ export function attachRecordingToCall(opts: {
     entityId: id,
     link: call.lead_id ? `/leads/${call.lead_id}#calls` : undefined,
   });
-  audit(req, 'RECORDING_ATTACHED', 'call_recording', recId, { call_id: id, storage: opts.storage });
+  await audit(req, 'RECORDING_ATTACHED', 'call_recording', recId, { call_id: id, storage: opts.storage });
   return { id: recId };
 }
 
 callsRouter.post('/:id(\\d+)/recording', requireAuth, requirePermission('calls:create'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const call = loadCall(id, req);
+    const call = await loadCall(id, req);
     assertCallWriteAccess(call, req);
     const body = meta(attachRecordingSchema, req.body);
     const user = currentUser(req);
@@ -777,7 +777,7 @@ callsRouter.post('/:id(\\d+)/recording', requireAuth, requirePermission('calls:c
       throw badRequest('Provide a provider recording id or reference URL.');
     }
 
-    const { id: recId } = attachRecordingToCall({
+    const { id: recId } = await attachRecordingToCall({
       call,
       req,
       actorId: user.id,
@@ -807,7 +807,7 @@ callsRouter.post(
   async (req, res, next) => {
     try {
       const id = Number(req.params.id);
-      const call = loadCall(id, req);
+      const call = await loadCall(id, req);
       assertCallWriteAccess(call, req);
       const user = currentUser(req);
 
@@ -821,7 +821,7 @@ callsRouter.post(
       const { saveRecordingFile } = await import('../../services/documents.js');
       const fileKey = saveRecordingFile(filename, mime, content);
 
-      const { id: recId } = attachRecordingToCall({
+      const { id: recId } = await attachRecordingToCall({
         call,
         req,
         actorId: user.id,
@@ -838,17 +838,17 @@ callsRouter.post(
   },
 );
 
-callsRouter.delete('/:id(\\d+)/recording', requireAuth, (req, res, next) => {
+callsRouter.delete('/:id(\\d+)/recording', requireAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const call = loadCall(id, req);
+    const call = await loadCall(id, req);
     assertCallWriteAccess(call, req);
-    const rec = loadRecording(id);
+    const rec = await loadRecording(id);
     if (!rec) throw notFound('No recording is attached to this call.');
-    const now = nowISO();
-    run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', ['DELETED', now, now, rec.id]);
-    run('UPDATE calls SET recording_available = 0, updated_at = ? WHERE id = ?', [now, id]);
-    audit(req, 'RECORDING_DELETED', 'call_recording', rec.id, { call_id: id });
+    const now = await nowISO();
+    await run('UPDATE call_recordings SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?', ['DELETED', now, now, rec.id]);
+    await run('UPDATE calls SET recording_available = 0, updated_at = ? WHERE id = ?', [now, id]);
+    await audit(req, 'RECORDING_DELETED', 'call_recording', rec.id, { call_id: id });
     ok(res, { deleted: true });
   } catch (err) {
     next(err);
@@ -858,7 +858,7 @@ callsRouter.delete('/:id(\\d+)/recording', requireAuth, (req, res, next) => {
 /* ---------------------- QUICK LEAD LINKED STATS --------------------- */
 
 /** Compact call stats used by dashboards and lead headers. */
-callsRouter.get('/stats/summary', requireAuth, (req, res, next) => {
+callsRouter.get('/stats/summary', requireAuth, async (req, res, next) => {
   try {
     const user = currentUser(req);
     const requestedWorker = Number(req.query.worker_id) || 0;
@@ -874,7 +874,7 @@ callsRouter.get('/stats/summary', requireAuth, (req, res, next) => {
     const from = dates.from ?? todayStr();
     const to = dates.to ?? todayStr();
 
-    const rows = get<any>(
+    const rows = (await get<any>(
       `SELECT
          COUNT(*) AS total,
          SUM(CASE WHEN status IN ('ANSWERED','COMPLETED') THEN 1 ELSE 0 END) AS answered,
@@ -888,15 +888,15 @@ callsRouter.get('/stats/summary', requireAuth, (req, res, next) => {
          ${workerClause}
          AND substr(COALESCE(started_at, created_at), 1, 10) BETWEEN ? AND ?`,
       [...workerParams, from, to],
-    )!;
+    ))!;
 
-    const connected = get<{ c: number }>(
+    const connected = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM calls WHERE deleted_at IS NULL
          ${workerClause}
          AND status IN ('ANSWERED','COMPLETED') AND COALESCE(duration_seconds,0) > 0
          AND substr(COALESCE(started_at, created_at), 1, 10) BETWEEN ? AND ?`,
       [...workerParams, from, to],
-    )!.c;
+    ))!.c;
 
     ok(res, {
       period: { from, to },

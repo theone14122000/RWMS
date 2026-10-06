@@ -29,10 +29,10 @@ declare global {
 
 let permissionCache: Map<string, Set<string>> | null = null;
 
-function rolePermissions(roleId: number): Set<string> {
+async function rolePermissions(roleId: number): Promise<Set<string>> {
   if (!permissionCache) {
     permissionCache = new Map();
-    const rows = all<{ role_id: number; code: string }>(
+    const rows = await all<{ role_id: number; code: string }>(
       'SELECT rp.role_id, p.code FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id',
     );
     for (const row of rows) {
@@ -50,6 +50,7 @@ export function invalidatePermissionCache(): void {
 interface SessionRow {
   id: string;
   user_id: number;
+  created_at: string;
   expires_at: string;
   revoked_at: string | null;
 }
@@ -66,24 +67,24 @@ interface UserRow {
   created_at: string;
 }
 
-export function createSession(userId: number, req: Request): { token: string; expiresAt: string } {
+export async function createSession(userId: number, req: Request): Promise<{ token: string; expiresAt: string }> {
   const token = randomToken();
   const hash = sha256(token);
   const now = new Date();
   const expires = new Date(now.getTime() + config.sessionTtlDays * 24 * 60 * 60 * 1000);
-  run(
+  await run(
     'INSERT INTO sessions (id, user_id, ip, user_agent, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
     [hash, userId, req.ip ?? null, (req.headers['user-agent'] ?? '').slice(0, 300) || null, now.toISOString(), expires.toISOString()],
   );
   return { token, expiresAt: expires.toISOString() };
 }
 
-export function revokeSession(token: string): void {
-  run('UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [nowISO(), sha256(token)]);
+export async function revokeSession(token: string): Promise<void> {
+  await run('UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [await nowISO(), sha256(token)]);
 }
 
-export function revokeAllSessions(userId: number): void {
-  run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL', [nowISO(), userId]);
+export async function revokeAllSessions(userId: number): Promise<void> {
+  await run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL', [await nowISO(), userId]);
 }
 
 export function setSessionCookie(res: Response, token: string): void {
@@ -113,18 +114,27 @@ export function clearSessionCookie(res: Response): void {
 }
 
 /** Resolves the session cookie into `req.user` (does not enforce authentication). */
-export const sessionLoader: RequestHandler = (req, _res, next) => {
+export const sessionLoader: RequestHandler = async (req, _res, next) => {
   try {
     const cookies = parseCookie(req.headers.cookie ?? '');
     const token = cookies[config.sessionCookieName];
     if (!token) return next();
 
-    const session = get<SessionRow>('SELECT id, user_id, expires_at, revoked_at FROM sessions WHERE id = ?', [
+    const session = await get<SessionRow>('SELECT id, user_id, created_at, expires_at, revoked_at FROM sessions WHERE id = ?', [
       sha256(token),
     ]);
     if (!session || session.revoked_at || new Date(session.expires_at).getTime() <= Date.now()) return next();
 
-    const user = get<UserRow>(
+    // Absolute lifetime: an active session can never outlive this cap, even
+    // with sliding renewal (bounds the value of a stolen cookie).
+    const absoluteMax =
+      new Date(session.created_at).getTime() + config.sessionAbsoluteTtlDays * 24 * 60 * 60 * 1000;
+    if (absoluteMax <= Date.now()) {
+      await run('UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [await nowISO(), session.id]);
+      return next();
+    }
+
+    const user = await get<UserRow>(
       `SELECT u.id, u.name, u.email, u.phone, u.status, u.role_id, u.last_login_at, u.created_at, r.code AS role_code
        FROM users u JOIN roles r ON r.id = u.role_id
        WHERE u.id = ? AND u.deleted_at IS NULL`,
@@ -136,7 +146,7 @@ export const sessionLoader: RequestHandler = (req, _res, next) => {
       return next();
     }
 
-    const permissions = Array.from(rolePermissions(user.role_id));
+    const permissions = Array.from(await rolePermissions(user.role_id));
     req.user = {
       id: user.id,
       name: user.name,
@@ -150,11 +160,11 @@ export const sessionLoader: RequestHandler = (req, _res, next) => {
     };
     req.sessionId = session.id;
 
-    // sliding session renewal
+    // sliding session renewal (capped by the absolute lifetime)
     const remaining = new Date(session.expires_at).getTime() - Date.now();
     if (remaining < (config.sessionTtlDays * 24 * 60 * 60 * 1000) / 2) {
-      const expires = new Date(Date.now() + config.sessionTtlDays * 24 * 60 * 60 * 1000);
-      run('UPDATE sessions SET expires_at = ? WHERE id = ?', [expires.toISOString(), session.id]);
+      const expires = Math.min(Date.now() + config.sessionTtlDays * 24 * 60 * 60 * 1000, absoluteMax);
+      await run('UPDATE sessions SET expires_at = ? WHERE id = ?', [new Date(expires).toISOString(), session.id]);
     }
     next();
   } catch (err) {

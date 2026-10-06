@@ -36,15 +36,15 @@ export interface CreateFollowUpInput {
  * workflow, so validation, timeline, audit and notifications behave the same
  * wherever a follow-up comes from.
  */
-export function createFollowUpRecord(opts: {
+export async function createFollowUpRecord(opts: {
   input: CreateFollowUpInput;
   user: { id: number; name: string };
   canCrossAssign: boolean;
   canScheduleOnAnyLead: boolean;
   req?: Request;
-}): number {
+}): Promise<number> {
   const { input, user } = opts;
-  const lead = get<{ id: number; assigned_to: number | null; lead_number: string }>(
+  const lead = await get<{ id: number; assigned_to: number | null; lead_number: string }>(
     `SELECT l.id, l.assigned_to, l.lead_number FROM leads l
       WHERE l.id = ? AND l.deleted_at IS NULL`,
     [input.lead_id],
@@ -58,14 +58,14 @@ export function createFollowUpRecord(opts: {
   if (workerId !== user.id && !opts.canCrossAssign) {
     throw forbidden('You cannot assign follow-ups to another worker.');
   }
-  const worker = get<{ id: number; status: string }>('SELECT id, status FROM users WHERE id = ? AND deleted_at IS NULL', [
+  const worker = await get<{ id: number; status: string }>('SELECT id, status FROM users WHERE id = ? AND deleted_at IS NULL', [
     workerId,
   ]);
   if (!worker) throw badRequest('Selected worker does not exist.');
   if (worker.status !== 'ACTIVE') throw badRequest('Selected worker is not active.');
 
-  const now = nowISO();
-  const id = run(
+  const now = await nowISO();
+  const id = (await run(
     `INSERT INTO follow_ups (lead_id, worker_id, scheduled_date, scheduled_time, type, status, notes, next_action,
       customer_response, created_by, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)`,
@@ -82,23 +82,23 @@ export function createFollowUpRecord(opts: {
       now,
       now,
     ],
-  ).lastInsertRowid;
+  )).lastInsertRowid;
 
-  addTimelineEvent({
+  await addTimelineEvent({
     leadId: input.lead_id,
     type: TIMELINE_TYPES.FOLLOW_UP_CREATED,
     actorId: user.id,
     summary: `Follow-up scheduled for ${input.scheduled_date}${input.scheduled_time ? ` ${input.scheduled_time}` : ''} (${input.type})`,
     metadata: { follow_up_id: id, worker_id: workerId, type: input.type },
   });
-  audit(opts.req, 'FOLLOW_UP_CREATED', 'follow_up', id, {
+  await audit(opts.req, 'FOLLOW_UP_CREATED', 'follow_up', id, {
     lead_id: input.lead_id,
     worker_id: workerId,
     scheduled_date: input.scheduled_date,
   });
 
   if (workerId !== user.id) {
-    notify({
+    await notify({
       userId: workerId,
       type: 'FOLLOW_UP_ASSIGNED',
       title: `Follow-up scheduled: ${lead.lead_number}`,
@@ -112,7 +112,7 @@ export function createFollowUpRecord(opts: {
   return id;
 }
 
-export function shapedFollowUpById(id: number): Record<string, any> | undefined {
-  const row = get(`${FU_SELECT} WHERE f.id = ?`, [id]);
+export async function shapedFollowUpById(id: number): Promise<Record<string, any> | undefined> {
+  const row = await get(`${FU_SELECT} WHERE f.id = ?`, [id]);
   return row ? shapeFollowUp(row) : undefined;
 }

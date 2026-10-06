@@ -10,12 +10,30 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
+import pg from 'pg';
 
 process.env.NODE_ENV = 'test';
 process.env.SEED_DEMO_DATA = 'false';
 process.env.SERVE_CLIENT = 'false';
 process.env.COOKIE_SECURE = 'false';
 process.env.TRUST_PROXY = '0';
+
+/**
+ * Local runs must stay on SQLite even when server/.env defines DATABASE_URL
+ * (process.loadEnvFile does not override variables that are already set).
+ * TEST_PG=1 opts into PostgreSQL instead, with a throwaway per-process schema
+ * so parallel test files never share state.
+ */
+let testPgSchema: string | null = null;
+if (process.env.TEST_PG === '1' && process.env.DATABASE_URL) {
+  testPgSchema = `rmws_t_${process.pid}_${Date.now().toString(36)}`;
+  const url = new URL(process.env.DATABASE_URL);
+  const options = (url.searchParams.get('options') ?? '').trim();
+  url.searchParams.set('options', `${options} -c search_path=${testPgSchema}`.trim());
+  process.env.DATABASE_URL = url.toString();
+} else {
+  process.env.DATABASE_URL = '';
+}
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'travel-crm-test-'));
 process.env.DATABASE_PATH = path.join(tmpDir, 'crm.sqlite');
@@ -26,12 +44,22 @@ const { createApp } = await import('../../src/app.js');
 const { closeDatabase } = await import('../../src/db/database.js');
 const { todayStr, addDays } = await import('../../src/lib/dates.js');
 
+if (testPgSchema) {
+  const client = new pg.Client({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 15_000 });
+  client.on('error', () => {
+    /* proxy resets on an in-use admin client must not crash the run */
+  });
+  await client.connect();
+  await client.query(`CREATE SCHEMA IF NOT EXISTS ${testPgSchema}`);
+  await client.end();
+}
+
 /** Business-timezone date helpers (Asia/Kolkata by default). */
 export const today: string = todayStr();
 export const day: (offset: number) => string = (offset) => addDays(todayStr(), offset);
 
-migrate();
-seed();
+await migrate();
+await seed();
 
 const server: http.Server = createApp().listen(0, '127.0.0.1');
 await new Promise<void>((resolve) => server.once('listening', () => resolve()));
@@ -170,6 +198,15 @@ export async function createWorkerClient(
 
 export async function closeHarness(): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  closeDatabase();
+  await closeDatabase();
+  if (testPgSchema) {
+    const client = new pg.Client({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 15_000 });
+    client.on('error', () => {
+      /* proxy resets on an in-use admin client must not crash the run */
+    });
+    await client.connect();
+    await client.query(`DROP SCHEMA IF EXISTS ${testPgSchema} CASCADE`);
+    await client.end();
+  }
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }

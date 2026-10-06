@@ -114,23 +114,25 @@ function mapEventToStatus(eventType: string): string | null {
 }
 
 function isUniqueViolation(err: unknown): boolean {
-  return err instanceof Error && /UNIQUE constraint failed/i.test(err.message);
+  if (!(err instanceof Error)) return false;
+  // SQLite: "UNIQUE constraint failed"; PostgreSQL: SQLSTATE 23505.
+  return /UNIQUE constraint failed/i.test(err.message) || (err as { code?: string }).code === '23505';
 }
 
-function findCall(provider: string, providerCallId: string) {
-  return get<any>('SELECT * FROM calls WHERE provider = ? AND provider_call_id = ? AND deleted_at IS NULL', [
+async function findCall(provider: string, providerCallId: string) {
+  return await get<any>('SELECT * FROM calls WHERE provider = ? AND provider_call_id = ? AND deleted_at IS NULL', [
     provider,
     providerCallId,
   ]);
 }
 
 /** Resolves the worker a webhook-attributed call belongs to. */
-function resolveWorker(event: WebhookEvent): { workerId: number; leadId: number | null } {
+async function resolveWorker(event: WebhookEvent): Promise<{ workerId: number; leadId: number | null }> {
   let leadId = event.lead_id ?? null;
   let workerId = event.worker_id ?? 0;
 
   if (leadId) {
-    const lead = get<{ assigned_to: number | null; customer_id: number }>(
+    const lead = await get<{ assigned_to: number | null; customer_id: number }>(
       'SELECT assigned_to, customer_id FROM leads WHERE id = ? AND deleted_at IS NULL',
       [leadId],
     );
@@ -138,7 +140,7 @@ function resolveWorker(event: WebhookEvent): { workerId: number; leadId: number 
     workerId = workerId || lead.assigned_to || 0;
   } else if (event.customer_id) {
     // Attribute to the customer's most recent active lead when possible.
-    const lead = get<{ id: number; assigned_to: number | null }>(
+    const lead = await get<{ id: number; assigned_to: number | null }>(
       `SELECT id, assigned_to FROM leads WHERE customer_id = ? AND deleted_at IS NULL
        ORDER BY COALESCE(last_contacted_at, created_at) DESC, id DESC LIMIT 1`,
       [event.customer_id],
@@ -152,7 +154,7 @@ function resolveWorker(event: WebhookEvent): { workerId: number; leadId: number 
   if (!workerId) {
     throw badRequest('Cannot attribute this call: include worker_id or lead_id in the webhook payload.');
   }
-  const worker = get<{ id: number; status: string }>(
+  const worker = await get<{ id: number; status: string }>(
     'SELECT id, status FROM users WHERE id = ? AND deleted_at IS NULL',
     [workerId],
   );
@@ -166,7 +168,7 @@ interface ProcessResult {
   action: string;
 }
 
-function processEvent(provider: string, event: WebhookEvent, req: any): ProcessResult {
+async function processEvent(provider: string, event: WebhookEvent, req: any): Promise<ProcessResult> {
   const callInfo = event.call;
   if (!callInfo && !event.recording) {
     throw badRequest('Webhook payload must include a call object.');
@@ -176,15 +178,15 @@ function processEvent(provider: string, event: WebhookEvent, req: any): ProcessR
   if (!providerCallId) throw badRequest('call.provider_call_id is required.');
 
   const incomingStatus = mapEventToStatus(event.event_type);
-  const now = nowISO();
-  let call = findCall(provider, providerCallId);
+  const now = await nowISO();
+  let call = await findCall(provider, providerCallId);
   let action: string;
 
   if (!call) {
-    const { workerId, leadId } = resolveWorker(event);
+    const { workerId, leadId } = await resolveWorker(event);
     const status = incomingStatus ?? callInfo?.status ?? 'COMPLETED';
-    const policy = callPolicy();
-    const newId = run(
+    const policy = await callPolicy();
+    const newId = (await run(
       `INSERT INTO calls (lead_id, customer_id, worker_id, provider, provider_call_id, direction, phone_number,
         started_at, answered_at, ended_at, duration_seconds, status, disposition, consent, webhook_event_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -211,12 +213,12 @@ function processEvent(provider: string, event: WebhookEvent, req: any): ProcessR
         now,
         now,
       ],
-    ).lastInsertRowid;
-    finalizeCallCreation({ id: newId, leadId, status, req, actorName: `Provider ${provider}` });
-    call = getCallRow(newId);
+    )).lastInsertRowid;
+    await finalizeCallCreation({ id: newId, leadId, status, req, actorName: `Provider ${provider}` });
+    call = await getCallRow(newId);
     action = 'call_created';
   } else if (incomingStatus && incomingStatus !== call.status) {
-    run(
+    await run(
       `UPDATE calls SET status = ?, answered_at = COALESCE(?, answered_at), ended_at = COALESCE(?, ended_at),
          duration_seconds = COALESCE(?, duration_seconds), disposition = COALESCE(?, disposition),
          webhook_event_id = ?, updated_at = ? WHERE id = ?`,
@@ -231,11 +233,11 @@ function processEvent(provider: string, event: WebhookEvent, req: any): ProcessR
         call.id,
       ],
     );
-    emitCallOutcome({ callId: call.id, leadId: call.lead_id, status: incomingStatus, req, actorName: `Provider ${provider}` });
-    call = getCallRow(call.id);
+    await emitCallOutcome({ callId: call.id, leadId: call.lead_id, status: incomingStatus, req, actorName: `Provider ${provider}` });
+    call = await getCallRow(call.id);
     action = 'call_updated';
   } else if (callInfo) {
-    run(
+    await run(
       `UPDATE calls SET answered_at = COALESCE(?, answered_at), ended_at = COALESCE(?, ended_at),
          duration_seconds = COALESCE(?, duration_seconds), disposition = COALESCE(?, disposition),
          webhook_event_id = ?, updated_at = ? WHERE id = ?`,
@@ -256,9 +258,9 @@ function processEvent(provider: string, event: WebhookEvent, req: any): ProcessR
 
   if (event.event_type.toLowerCase().includes('recording')) {
     if (!event.recording) throw badRequest('recording payload is required for recording events.');
-    const existing = loadRecording(call.id);
+    const existing = await loadRecording(call.id);
     if (!existing || existing.status !== 'AVAILABLE') {
-      attachRecordingToCall({
+      await attachRecordingToCall({
         call,
         req,
         actorId: null,
@@ -279,13 +281,13 @@ function processEvent(provider: string, event: WebhookEvent, req: any): ProcessR
 }
 
 /** Timeline/notify side effects when a status transition arrives from a provider. */
-function emitCallOutcome(opts: {
+async function emitCallOutcome(opts: {
   callId: number;
   leadId: number | null;
   status: string;
   req?: any;
   actorName?: string;
-}): void {
+}): Promise<void> {
   const { callId, leadId, status } = opts;
   if (!leadId) return;
   const type =
@@ -295,7 +297,7 @@ function emitCallOutcome(opts: {
         ? TIMELINE_TYPES.CALL_INITIATED
         : TIMELINE_TYPES.CALL_COMPLETED;
 
-  addTimelineEvent({
+  await addTimelineEvent({
     leadId,
     type,
     actorId: null,
@@ -304,16 +306,16 @@ function emitCallOutcome(opts: {
   });
 
   if (status === 'COMPLETED' || status === 'ANSWERED') {
-    run('UPDATE leads SET last_contacted_at = ?, updated_at = ? WHERE id = ?', [nowISO(), nowISO(), leadId]);
+    await run('UPDATE leads SET last_contacted_at = ?, updated_at = ? WHERE id = ?', [await nowISO(), await nowISO(), leadId]);
   }
 
   if (status === 'MISSED') {
-    const lead = get<{ assigned_to: number | null; lead_number: string }>(
+    const lead = await get<{ assigned_to: number | null; lead_number: string }>(
       'SELECT assigned_to, lead_number FROM leads WHERE id = ?',
       [leadId],
     );
     if (lead?.assigned_to) {
-      notify({
+      await notify({
         userId: lead.assigned_to,
         type: 'CALL_MISSED',
         title: `Missed call: ${lead.lead_number}`,
@@ -326,7 +328,7 @@ function emitCallOutcome(opts: {
   }
 }
 
-telephonyWebhooksRouter.post('/telephony/:provider', (req, res, next) => {
+telephonyWebhooksRouter.post('/telephony/:provider', async (req, res, next) => {
   try {
     const provider = String(req.params.provider || '').trim().toLowerCase();
     if (!/^[a-z0-9_-]{1,40}$/.test(provider)) throw badRequest('Invalid provider code.');
@@ -342,10 +344,10 @@ telephonyWebhooksRouter.post('/telephony/:provider', (req, res, next) => {
     }
     const event = meta(eventSchema, payload);
 
-    const now = nowISO();
+    const now = await nowISO();
     let eventRowId: number;
     try {
-      eventRowId = run(
+      eventRowId = (await run(
         `INSERT INTO webhook_events (provider, event_id, event_type, signature, status, payload, received_at, created_at)
          VALUES (?, ?, ?, ?, 'RECEIVED', ?, ?, ?)`,
         [
@@ -357,10 +359,10 @@ telephonyWebhooksRouter.post('/telephony/:provider', (req, res, next) => {
           now,
           now,
         ],
-      ).lastInsertRowid;
+      )).lastInsertRowid;
     } catch (err) {
       if (isUniqueViolation(err)) {
-        const dup = get<{ id: number; status: string; call_id: number | null }>(
+        const dup = await get<{ id: number; status: string; call_id: number | null }>(
           'SELECT id, status, call_id FROM webhook_events WHERE provider = ? AND event_id = ?',
           [provider, event.event_id],
         );
@@ -371,14 +373,14 @@ telephonyWebhooksRouter.post('/telephony/:provider', (req, res, next) => {
     }
 
     try {
-      const result = processEvent(provider, event, req);
-      run('UPDATE webhook_events SET status = ?, call_id = ?, processed_at = ? WHERE id = ?', [
+      const result = await processEvent(provider, event, req);
+      await run('UPDATE webhook_events SET status = ?, call_id = ?, processed_at = ? WHERE id = ?', [
         'PROCESSED',
         result.callId,
-        nowISO(),
+        await nowISO(),
         eventRowId,
       ]);
-      audit(req, 'WEBHOOK_PROCESSED', 'webhook_event', eventRowId, {
+      await audit(req, 'WEBHOOK_PROCESSED', 'webhook_event', eventRowId, {
         provider,
         event_type: event.event_type,
         call_id: result.callId,
@@ -387,10 +389,10 @@ telephonyWebhooksRouter.post('/telephony/:provider', (req, res, next) => {
       ok(res, { ok: true, call_id: result.callId, action: result.action });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Processing failed.';
-      run('UPDATE webhook_events SET status = ?, error = ?, processed_at = ? WHERE id = ?', [
+      await run('UPDATE webhook_events SET status = ?, error = ?, processed_at = ? WHERE id = ?', [
         'FAILED',
         message,
-        nowISO(),
+        await nowISO(),
         eventRowId,
       ]);
       // Validation/attribution problems are permanent: acknowledge so the
@@ -407,7 +409,7 @@ telephonyWebhooksRouter.post('/telephony/:provider', (req, res, next) => {
 });
 
 /** Webhook inbox — lets the admin see exactly what a provider sent and why. */
-telephonyWebhooksRouter.get('/telephony/events', requireAuth, requirePermission('calls:read_all'), (req, res, next) => {
+telephonyWebhooksRouter.get('/telephony/events', requireAuth, requirePermission('calls:read_all'), async (req, res, next) => {
   try {
     const where: string[] = ['1=1'];
     const params: unknown[] = [];
@@ -434,8 +436,8 @@ telephonyWebhooksRouter.get('/telephony/events', requireAuth, requirePermission(
 
     const { page, limit, offset } = pagination(req.query, 20, 100);
     const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total = get<{ c: number }>(`SELECT COUNT(*) AS c FROM webhook_events ${whereSql}`, params)!.c;
-    const rows = all(
+    const total = (await get<{ c: number }>(`SELECT COUNT(*) AS c FROM webhook_events ${whereSql}`, params))!.c;
+    const rows = await all(
       `SELECT id, provider, event_id, event_type, status, error, call_id, received_at, processed_at, created_at
        FROM webhook_events ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`,
       [...params, limit, offset],

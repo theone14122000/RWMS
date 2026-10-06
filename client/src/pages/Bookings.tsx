@@ -277,7 +277,7 @@ function BookingDetail({ booking, onChanged }: { booking: any; onChanged: () => 
         ) : null}
       </div>
 
-      <div className="kpi-grid" style={{ gridTemplateColumns: '1fr 1fr 1fr' }}>
+      <div className="kpi-grid kpi-3">
         <div className="kpi">
           <div className="label">Total</div>
           <div className="value" style={{ fontSize: 17 }}>{formatCurrency(booking.total_amount, booking.currency)}</div>

@@ -153,7 +153,7 @@ interface LeadFilters {
   customerId?: number;
 }
 
-function buildWhere(filters: LeadFilters, req: any): { where: string[]; params: unknown[] } {
+async function buildWhere(filters: LeadFilters, req: any): Promise<{ where: string[]; params: unknown[] }> {
   const user = currentUser(req);
   const readAll = can(req, 'leads:read_all');
   const where: string[] = ['l.deleted_at IS NULL'];
@@ -170,7 +170,7 @@ function buildWhere(filters: LeadFilters, req: any): { where: string[]; params: 
         OR c.email LIKE ? ESCAPE '\\' OR l.lead_number LIKE ? ESCAPE '\\' OR l.destination LIKE ? ESCAPE '\\'
         OR u.name LIKE ? ESCAPE '\\')`,
     );
-    const term = likeTerm(filters.search);
+    const term = await likeTerm(filters.search);
     params.push(term, term, term, term, term, term, term);
   }
   if (filters.statuses.length) {
@@ -199,7 +199,7 @@ function buildWhere(filters: LeadFilters, req: any): { where: string[]; params: 
   }
   if (filters.destination) {
     where.push(`l.destination LIKE ? ESCAPE '\\'`);
-    params.push(likeTerm(filters.destination));
+    params.push(await likeTerm(filters.destination));
   }
   if (filters.assigned === 'unassigned') where.push('l.assigned_to IS NULL');
   if (filters.assigned === 'assigned') where.push('l.assigned_to IS NOT NULL');
@@ -259,15 +259,16 @@ function readFilters(req: any): LeadFilters {
 
 /* ------------------------------- routes ------------------------------- */
 
-leadsRouter.get('/check-duplicate', requireAuth, (req, res, next) => {
+leadsRouter.get('/check-duplicate', requireAuth, async (req, res, next) => {
   try {
-    const customers = findDuplicates({
+    if (!can(req, 'leads:create') && !can(req, 'leads:read_all')) throw forbidden();
+    const customers = await findDuplicates({
       phone: String(req.query.phone ?? ''),
       whatsapp: String(req.query.whatsapp ?? ''),
       email: String(req.query.email ?? ''),
     });
     const leadMatches = customers.length
-      ? all(
+      ? await all(
           `SELECT l.id, l.lead_number, l.destination, l.created_at, s.code AS status
            FROM leads l JOIN lead_statuses s ON s.id = l.status_id
            WHERE l.deleted_at IS NULL AND l.customer_id IN (${customers.map(() => '?').join(',')})
@@ -275,21 +276,22 @@ leadsRouter.get('/check-duplicate', requireAuth, (req, res, next) => {
           customers.map((c) => c.id),
         )
       : [];
+    await audit(req, 'LEAD_DUPLICATE_CHECKED', 'lead', null, { customer_matches: customers.length });
     ok(res, { customers, leads: leadMatches, is_duplicate: customers.length > 0 });
   } catch (err) {
     next(err);
   }
 });
 
-leadsRouter.get('/', requireAuth, (req, res, next) => {
+leadsRouter.get('/', requireAuth, async (req, res, next) => {
   try {
     if (!can(req, 'leads:read_all') && !can(req, 'leads:read_own')) throw forbidden();
     const { page, limit, offset } = pagination(req.query, 20, 200);
     const filters = readFilters(req);
-    const { where, params } = buildWhere(filters, req);
+    const { where, params } = await buildWhere(filters, req);
     const whereSql = `WHERE ${where.join(' AND ')}`;
 
-    const total = get<{ c: number }>(
+    const total = (await get<{ c: number }>(
       `SELECT COUNT(*) AS c FROM leads l
        JOIN customers c ON c.id = l.customer_id
        JOIN lead_statuses s ON s.id = l.status_id
@@ -297,7 +299,7 @@ leadsRouter.get('/', requireAuth, (req, res, next) => {
        LEFT JOIN users u ON u.id = l.assigned_to
        ${whereSql}`,
       params,
-    )!.c;
+    ))!.c;
 
     const sort = String(req.query.sort ?? 'recent');
     const orderSql =
@@ -311,7 +313,7 @@ leadsRouter.get('/', requireAuth, (req, res, next) => {
               ? 'next_fu_date IS NULL, next_fu_date ASC, l.created_at DESC'
               : 'l.created_at DESC, l.id DESC';
 
-    const rows = all(`${LEAD_SELECT} ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`, [
+    const rows = await all(`${LEAD_SELECT} ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`, [
       ...params,
       limit,
       offset,
@@ -323,7 +325,7 @@ leadsRouter.get('/', requireAuth, (req, res, next) => {
   }
 });
 
-leadsRouter.post('/', requireAuth, requirePermission('leads:create'), (req, res, next) => {
+leadsRouter.post('/', requireAuth, requirePermission('leads:create'), async (req, res, next) => {
   try {
     const body = meta(createLeadSchema, req.body);
     const user = currentUser(req);
@@ -332,7 +334,7 @@ leadsRouter.post('/', requireAuth, requirePermission('leads:create'), (req, res,
     let duplicateWarnings: unknown[] = [];
 
     if (!customerId && body.customer) {
-      duplicateWarnings = findDuplicates(body.customer);
+      duplicateWarnings = await findDuplicates(body.customer);
       if (duplicateWarnings.length && !body.allow_duplicate) {
         return res.status(409).json({
           error: {
@@ -342,8 +344,8 @@ leadsRouter.post('/', requireAuth, requirePermission('leads:create'), (req, res,
           },
         });
       }
-      const now = nowISO();
-      customerId = run(
+      const now = await nowISO();
+      customerId = (await run(
         `INSERT INTO customers (name, phone, whatsapp, email, city, state, country, created_by, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
@@ -358,35 +360,35 @@ leadsRouter.post('/', requireAuth, requirePermission('leads:create'), (req, res,
           now,
           now,
         ],
-      ).lastInsertRowid;
+      )).lastInsertRowid;
     }
 
     if (!customerId) throw badRequest('Customer is required.');
-    const customer = get<{ id: number }>('SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL', [customerId]);
+    const customer = await get<{ id: number }>('SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL', [customerId]);
     if (!customer) throw badRequest('Selected customer does not exist.');
 
     if (body.assigned_to && !can(req, 'leads:assign')) {
       throw forbidden('You do not have permission to assign leads.');
     }
 
-    const status = get<{ id: number }>('SELECT id FROM lead_statuses WHERE code = ? AND is_active = 1', [body.status]);
+    const status = await get<{ id: number }>('SELECT id FROM lead_statuses WHERE code = ? AND is_active = 1', [body.status]);
     if (!status) throw badRequest('Unknown lead status.');
 
     if (body.source_id) {
-      const source = get('SELECT id FROM lead_sources WHERE id = ? AND is_active = 1', [body.source_id]);
+      const source = await get('SELECT id FROM lead_sources WHERE id = ? AND is_active = 1', [body.source_id]);
       if (!source) throw badRequest('Unknown lead source.');
     }
 
-    const now = nowISO();
-    const leadId = tx(() => {
-      const inserted = run(
+    const now = await nowISO();
+    const leadId = await tx(async () => {
+      const inserted = (await run(
         `INSERT INTO leads (lead_number, customer_id, source_id, assigned_to, destination, travel_type, trip_type,
           requirements, travel_start_date, travel_end_date, duration_days, adults, children, total_travelers,
           budget, currency, priority, status_id, last_contacted_at, next_follow_up_at, notes, created_by, updated_by,
           created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          nextLeadNumber(),
+          await nextLeadNumber(),
           customerId,
           body.source_id ?? null,
           body.assigned_to ?? null,
@@ -412,9 +414,9 @@ leadsRouter.post('/', requireAuth, requirePermission('leads:create'), (req, res,
           now,
           now,
         ],
-      ).lastInsertRowid;
+      )).lastInsertRowid;
 
-      addTimelineEvent({
+      await addTimelineEvent({
         leadId: inserted,
         type: TIMELINE_TYPES.LEAD_CREATED,
         actorId: user.id,
@@ -426,36 +428,36 @@ leadsRouter.post('/', requireAuth, requirePermission('leads:create'), (req, res,
     });
 
     if (body.assigned_to) {
-      const lead = get<any>('SELECT * FROM leads WHERE id = ?', [leadId])!;
-      assignLead({ lead, toUserId: body.assigned_to, actorId: user.id, actorName: user.name });
-    } else if (assignmentConfig().auto_assign_new) {
-      const lead = get<any>('SELECT * FROM leads WHERE id = ?', [leadId])!;
-      autoAssignLead({ lead, actorId: user.id, actorName: user.name });
+      const lead = (await get<any>('SELECT * FROM leads WHERE id = ?', [leadId]))!;
+      await assignLead({ lead, toUserId: body.assigned_to, actorId: user.id, actorName: user.name });
+    } else if ((await assignmentConfig()).auto_assign_new) {
+      const lead = (await get<any>('SELECT * FROM leads WHERE id = ?', [leadId]))!;
+      await autoAssignLead({ lead, actorId: user.id, actorName: user.name });
     }
 
-    audit(req, 'LEAD_CREATED', 'lead', leadId, {
+    await audit(req, 'LEAD_CREATED', 'lead', leadId, {
       destination: body.destination,
       customer_id: customerId,
       assigned_to: body.assigned_to ?? null,
       duplicates: duplicateWarnings.length,
     });
 
-    const row = get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
+    const row = await get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
     created(res, shapeLead(row!));
   } catch (err) {
     next(err);
   }
 });
 
-leadsRouter.get('/:id(\\d+)', requireAuth, (req, res, next) => {
+leadsRouter.get('/:id(\\d+)', requireAuth, async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    loadLead(leadId, req);
-    const row = get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
+    await loadLead(leadId, req);
+    const row = await get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
     if (!row) throw notFound('Lead not found.');
     const detail = shapeLead(row);
 
-    const statusHistory = all(
+    const statusHistory = await all(
       `SELECT h.id, h.remark, h.changed_at, fs.code AS from_code, fs.name AS from_name, ts.code AS to_code, ts.name AS to_name,
               u.name AS changed_by_name
        FROM lead_status_history h
@@ -466,7 +468,7 @@ leadsRouter.get('/:id(\\d+)', requireAuth, (req, res, next) => {
       [leadId],
     );
 
-    const openFollowUps = all(
+    const openFollowUps = await all(
       `SELECT f.*, u.name AS worker_name FROM follow_ups f JOIN users u ON u.id = f.worker_id
        WHERE f.lead_id = ? AND f.deleted_at IS NULL AND f.status NOT IN ${FOLLOW_UP_TERMINAL}
        ORDER BY f.scheduled_date ASC, f.scheduled_time ASC LIMIT 5`,
@@ -483,10 +485,10 @@ leadsRouter.get('/:id(\\d+)', requireAuth, (req, res, next) => {
   }
 });
 
-leadsRouter.patch('/:id(\\d+)', requireAuth, (req, res, next) => {
+leadsRouter.patch('/:id(\\d+)', requireAuth, async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    const lead = loadLead(leadId, req);
+    const lead = await loadLead(leadId, req);
     assertLeadWriteAccess(lead, req);
     const body = meta(updateLeadSchema, req.body);
     const user = currentUser(req);
@@ -506,11 +508,11 @@ leadsRouter.patch('/:id(\\d+)', requireAuth, (req, res, next) => {
       throw badRequest('End date must be on or after start date.');
     }
 
-    const now = nowISO();
+    const now = await nowISO();
     const changed: string[] = [];
 
-    tx(() => {
-      run(
+    await tx(async () => {
+      await run(
         `UPDATE leads SET destination = ?, travel_type = ?, trip_type = ?, requirements = ?,
           travel_start_date = ?, travel_end_date = ?, duration_days = ?, adults = ?, children = ?, total_travelers = ?,
           budget = ?, currency = ?, priority = ?, notes = ?, last_contacted_at = ?, next_follow_up_at = ?,
@@ -549,7 +551,7 @@ leadsRouter.patch('/:id(\\d+)', requireAuth, (req, res, next) => {
       }
 
       if (changed.length) {
-        addTimelineEvent({
+        await addTimelineEvent({
           leadId,
           type: TIMELINE_TYPES.LEAD_UPDATED,
           actorId: user.id,
@@ -560,49 +562,49 @@ leadsRouter.patch('/:id(\\d+)', requireAuth, (req, res, next) => {
     });
 
     if (body.status) {
-      changeLeadStatus({ leadId, toCode: body.status, actorId: user.id });
+      await changeLeadStatus({ leadId, toCode: body.status, actorId: user.id });
     }
 
-    if (changed.length || body.status) audit(req, 'LEAD_UPDATED', 'lead', leadId, { fields: changed, status: body.status });
+    if (changed.length || body.status) await audit(req, 'LEAD_UPDATED', 'lead', leadId, { fields: changed, status: body.status });
 
-    const row = get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
+    const row = await get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
     ok(res, shapeLead(row!));
   } catch (err) {
     next(err);
   }
 });
 
-leadsRouter.post('/:id(\\d+)/status', requireAuth, (req, res, next) => {
+leadsRouter.post('/:id(\\d+)/status', requireAuth, async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    const lead = loadLead(leadId, req);
+    const lead = await loadLead(leadId, req);
     assertLeadWriteAccess(lead, req);
     const body = meta(statusSchema, req.body);
     const user = currentUser(req);
 
-    const result = changeLeadStatus({ leadId, toCode: body.status, actorId: user.id, remark: body.remark });
+    const result = await changeLeadStatus({ leadId, toCode: body.status, actorId: user.id, remark: body.remark });
     if (result) {
-      audit(req, 'LEAD_STATUS_CHANGED', 'lead', leadId, result);
+      await audit(req, 'LEAD_STATUS_CHANGED', 'lead', leadId, result);
       if (result.to === 'CONVERTED') {
-        notifyRoleAdmins(leadId, lead.lead_number, user.name, 'converted');
+        await notifyRoleAdmins(leadId, lead.lead_number, user.name, 'converted');
       }
     }
 
-    const row = get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
+    const row = await get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
     ok(res, { ...shapeLead(row!), changed: Boolean(result) });
   } catch (err) {
     next(err);
   }
 });
 
-leadsRouter.post('/:id(\\d+)/assign', requireAuth, requirePermission('leads:assign'), (req, res, next) => {
+leadsRouter.post('/:id(\\d+)/assign', requireAuth, requirePermission('leads:assign'), async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    const lead = loadLead(leadId, req);
+    const lead = await loadLead(leadId, req);
     const body = meta(assignSchema, req.body);
     const user = currentUser(req);
 
-    const result = assignLead({
+    const result = await assignLead({
       lead,
       toUserId: body.worker_id,
       actorId: user.id,
@@ -610,21 +612,21 @@ leadsRouter.post('/:id(\\d+)/assign', requireAuth, requirePermission('leads:assi
       reason: body.reason,
     });
     if (result.changed) {
-      audit(req, result.to ? (result.from ? 'LEAD_REASSIGNED' : 'LEAD_ASSIGNED') : 'LEAD_UNASSIGNED', 'lead', leadId, {
+      await audit(req, result.to ? (result.from ? 'LEAD_REASSIGNED' : 'LEAD_ASSIGNED') : 'LEAD_UNASSIGNED', 'lead', leadId, {
         from: result.from,
         to: result.to,
         reason: body.reason ?? null,
       });
     }
 
-    const row = get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
+    const row = await get(`${LEAD_SELECT} WHERE l.id = ?`, [leadId]);
     ok(res, { ...shapeLead(row!), changed: result.changed });
   } catch (err) {
     next(err);
   }
 });
 
-leadsRouter.post('/bulk/assign', requireAuth, requirePermission('leads:assign'), (req, res, next) => {
+leadsRouter.post('/bulk/assign', requireAuth, requirePermission('leads:assign'), async (req, res, next) => {
   try {
     const body = meta(bulkAssignSchema, req.body);
     const user = currentUser(req);
@@ -632,12 +634,12 @@ leadsRouter.post('/bulk/assign', requireAuth, requirePermission('leads:assign'),
 
     for (const leadId of body.lead_ids) {
       try {
-        const lead = get<any>('SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL', [leadId]);
+        const lead = await get<any>('SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL', [leadId]);
         if (!lead) {
           results.failed.push({ id: leadId, message: 'Lead not found' });
           continue;
         }
-        const result = assignLead({
+        const result = await assignLead({
           lead,
           toUserId: body.worker_id,
           actorId: user.id,
@@ -648,7 +650,7 @@ leadsRouter.post('/bulk/assign', requireAuth, requirePermission('leads:assign'),
         else if (result.from) results.reassigned += 1;
         else results.assigned += 1;
         if (result.changed) {
-          audit(req, result.from ? 'LEAD_REASSIGNED' : 'LEAD_ASSIGNED', 'lead', leadId, {
+          await audit(req, result.from ? 'LEAD_REASSIGNED' : 'LEAD_ASSIGNED', 'lead', leadId, {
             from: result.from,
             to: result.to,
             bulk: true,
@@ -665,12 +667,12 @@ leadsRouter.post('/bulk/assign', requireAuth, requirePermission('leads:assign'),
   }
 });
 
-leadsRouter.get('/:id(\\d+)/timeline', requireAuth, (req, res, next) => {
+leadsRouter.get('/:id(\\d+)/timeline', requireAuth, async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    loadLead(leadId, req);
+    await loadLead(leadId, req);
     const limit = Math.min(300, Number(req.query.limit) || 100);
-    const rows = all(
+    const rows = await all(
       `SELECT t.id, t.type, t.summary, t.metadata, t.created_at, u.name AS actor_name, u.id AS actor_id
        FROM lead_timeline t LEFT JOIN users u ON u.id = t.actor_id
        WHERE t.lead_id = ? ORDER BY t.created_at DESC, t.id DESC LIMIT ?`,
@@ -685,11 +687,11 @@ leadsRouter.get('/:id(\\d+)/timeline', requireAuth, (req, res, next) => {
   }
 });
 
-leadsRouter.get('/:id(\\d+)/assignments', requireAuth, (req, res, next) => {
+leadsRouter.get('/:id(\\d+)/assignments', requireAuth, async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    loadLead(leadId, req);
-    const rows = all(
+    await loadLead(leadId, req);
+    const rows = await all(
       `SELECT a.id, a.action, a.reason, a.assigned_at, a.released_at, a.is_active,
               to_u.name AS assigned_to_name, to_u.id AS assigned_to_id,
               by_u.name AS assigned_by_name
@@ -705,11 +707,11 @@ leadsRouter.get('/:id(\\d+)/assignments', requireAuth, (req, res, next) => {
   }
 });
 
-leadsRouter.get('/:id(\\d+)/notes', requireAuth, (req, res, next) => {
+leadsRouter.get('/:id(\\d+)/notes', requireAuth, async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    loadLead(leadId, req);
-    const rows = all(
+    await loadLead(leadId, req);
+    const rows = await all(
       `SELECT n.id, n.content, n.created_at, n.updated_at, u.id AS author_id, u.name AS author_name
        FROM notes n JOIN users u ON u.id = n.author_id
        WHERE n.lead_id = ? AND n.deleted_at IS NULL ORDER BY n.created_at DESC`,
@@ -721,32 +723,32 @@ leadsRouter.get('/:id(\\d+)/notes', requireAuth, (req, res, next) => {
   }
 });
 
-leadsRouter.post('/:id(\\d+)/notes', requireAuth, requirePermission('notes:create'), (req, res, next) => {
+leadsRouter.post('/:id(\\d+)/notes', requireAuth, requirePermission('notes:create'), async (req, res, next) => {
   try {
     const leadId = Number(req.params.id);
-    const lead = loadLead(leadId, req);
+    const lead = await loadLead(leadId, req);
     if (!can(req, 'leads:update') && lead.assigned_to !== currentUser(req).id) {
       throw forbidden('You can only add notes to your own leads.');
     }
     const body = meta(noteSchema, req.body);
     const user = currentUser(req);
-    const now = nowISO();
-    const noteId = run('INSERT INTO notes (lead_id, author_id, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
+    const now = await nowISO();
+    const noteId = (await run('INSERT INTO notes (lead_id, author_id, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
       leadId,
       user.id,
       body.content,
       now,
       now,
-    ]).lastInsertRowid;
+    ])).lastInsertRowid;
 
-    addTimelineEvent({
+    await addTimelineEvent({
       leadId,
       type: TIMELINE_TYPES.NOTE_ADDED,
       actorId: user.id,
       summary: `Note added by ${user.name}`,
       metadata: { note_id: noteId, preview: body.content.slice(0, 120) },
     });
-    audit(req, 'NOTE_ADDED', 'lead', leadId, { note_id: noteId });
+    await audit(req, 'NOTE_ADDED', 'lead', leadId, { note_id: noteId });
 
     created(res, {
       id: noteId,
@@ -761,13 +763,13 @@ leadsRouter.post('/:id(\\d+)/notes', requireAuth, requirePermission('notes:creat
   }
 });
 
-function notifyRoleAdmins(leadId: number, leadNumber: string, actorName: string, outcome: string): void {
-  const admins = all<{ id: number }>(
+async function notifyRoleAdmins(leadId: number, leadNumber: string, actorName: string, outcome: string): Promise<void> {
+  const admins = await all<{ id: number }>(
     `SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id
      WHERE r.code = 'ADMIN' AND u.status = 'ACTIVE' AND u.deleted_at IS NULL`,
   );
   for (const admin of admins) {
-    notify({
+    await notify({
       userId: admin.id,
       type: 'LEAD_CONVERTED',
       title: `${leadNumber} marked as converted`,
