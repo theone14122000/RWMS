@@ -44,6 +44,18 @@ function bool(key: string, fallback: boolean): boolean {
   return v === '1' || v.toLowerCase() === 'true' || v.toLowerCase() === 'yes';
 }
 
+// Express "trust proxy" as a hop count (0 = disabled): express-rate-limit
+// rejects a literal `true` (ERR_ERL_PERMISSIVE_TRUST_PROXY) while a number of
+// trusted hops is the correct setting behind Vercel's proxy.
+function hops(key: string, fallback: number): number {
+  const v = process.env[key];
+  if (v === undefined || v === '') return fallback;
+  const n = Number(v);
+  if (Number.isFinite(n)) return Math.max(0, Math.trunc(n));
+  const s = v.toLowerCase();
+  return s === 'true' || s === 'yes' ? 1 : 0;
+}
+
 const nodeEnv = str('NODE_ENV', 'development');
 const isProduction = nodeEnv === 'production';
 
@@ -71,7 +83,7 @@ export const config = {
   sessionTtlDays: num('SESSION_TTL_DAYS', 7),
   sessionAbsoluteTtlDays: num('SESSION_ABSOLUTE_TTL_DAYS', 30),
   cookieSecure: bool('COOKIE_SECURE', isProduction),
-  trustProxy: bool('TRUST_PROXY', false),
+  trustProxy: hops('TRUST_PROXY', 0),
   businessTimezone: str('BUSINESS_TIMEZONE', 'Asia/Kolkata'),
   clientDist: path.join(PROJECT_ROOT, 'client', 'dist'),
   serveClient: bool('SERVE_CLIENT', true),
@@ -85,7 +97,6 @@ export const config = {
     minutes: num('LOGIN_LOCKOUT_MINUTES', 15),
   },
   passwordResetTtlMinutes: num('PASSWORD_RESET_TTL_MINUTES', 30),
-  seedDemoData: bool('SEED_DEMO_DATA', nodeEnv === 'development'),
   admin: {
     name: str('ADMIN_NAME', 'System Owner'),
     email: str('ADMIN_EMAIL', 'admin@travelcrm.local'),

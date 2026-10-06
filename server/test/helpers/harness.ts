@@ -13,7 +13,6 @@ import type { AddressInfo } from 'node:net';
 import pg from 'pg';
 
 process.env.NODE_ENV = 'test';
-process.env.SEED_DEMO_DATA = 'false';
 process.env.SERVE_CLIENT = 'false';
 process.env.COOKIE_SECURE = 'false';
 process.env.TRUST_PROXY = '0';

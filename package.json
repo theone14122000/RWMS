@@ -2,6 +2,7 @@
   "name": "travel-agency-crm",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Travel Agency CRM - Part 1 (Foundation, Authentication, Workers, Customers, Leads & Follow-ups)",
   "workspaces": [
     "server",

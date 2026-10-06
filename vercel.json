@@ -26,7 +26,6 @@
   "env": {
     "SERVE_CLIENT": "false",
     "TRUST_PROXY": "1",
-    "DATABASE_PATH": "/tmp/crm.sqlite",
-    "SEED_DEMO_DATA": "false"
+    "DATABASE_PATH": "/tmp/crm.sqlite"
   }
 }
