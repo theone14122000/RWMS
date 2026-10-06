@@ -42,7 +42,10 @@ export function todayStr(tz: string = businessTimezone(), at: Date = new Date())
 }
 
 export function addDays(dateStr: string, days: number): string {
-  const d = new Date(`${dateStr}T00:00:00Z`);
+  // Accept both YYYY-MM-DD and full ISO timestamps (callers pass nowISO()).
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(dateStr)
+    ? new Date(`${dateStr}T00:00:00Z`)
+    : new Date(dateStr);
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 }
